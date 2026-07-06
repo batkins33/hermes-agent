@@ -562,14 +562,54 @@ def _write_task_script() -> Path:
 # ---------------------------------------------------------------------------
 
 def _resolve_task_user() -> str | None:
-    """Return ``DOMAIN\\USER`` if available, else bare USERNAME, else None."""
+    """Return ``DOMAIN\\USER`` for true domain accounts; otherwise None.
+
+    Workgroup and local-machine accounts can create the Scheduled Task by
+    importing XML without an explicit run-as user. Passing ``/RU`` for those
+    accounts makes ``schtasks`` prompt for a password or fail SID mapping under
+    non-interactive SSH sessions, so we intentionally omit it.
+    """
     username = os.environ.get("USERNAME") or os.environ.get("USER") or os.environ.get("LOGNAME")
     if not username:
         return None
     if "\\" in username:
         return username
     domain = os.environ.get("USERDOMAIN")
-    return f"{domain}\\{username}" if domain else username
+    if not domain:
+        return None
+    computer = os.environ.get("COMPUTERNAME")
+    if domain.upper() == "WORKGROUP":
+        return None
+    if computer and domain.upper() == computer.upper():
+        return None
+    return f"{domain}\\{username}"
+
+
+def _resolve_logon_trigger_user() -> str | None:
+    """Return the user identifier for the Scheduled Task logon trigger.
+
+    Task Scheduler XML expects LogonTrigger.UserId to be set when a task should
+    follow a specific user. Microsoft documents the accepted forms as either a
+    domain-qualified name (``MyDomain\\MyName``) or, for a local account, the
+    bare username (``Administrator``).
+
+    This is separate from ``_resolve_task_user()`` because the Scheduled Task
+    principal still intentionally avoids ``/RU`` for local/workgroup accounts
+    while the trigger itself needs a concrete user identifier to register
+    cleanly.
+    """
+    username = os.environ.get("USERNAME") or os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not username:
+        return None
+    if "\\" in username:
+        return username
+    domain = os.environ.get("USERDOMAIN")
+    if not domain or domain.upper() == "WORKGROUP":
+        return username
+    computer = os.environ.get("COMPUTERNAME")
+    if computer and domain.upper() == computer.upper():
+        return username
+    return f"{domain}\\{username}"
 
 
 def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | None) -> str:
@@ -588,6 +628,7 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+      <UserId>{escape(_resolve_logon_trigger_user() or "")}</UserId>
       <Delay>{_TASK_LOGON_DELAY}</Delay>
     </LogonTrigger>
   </Triggers>

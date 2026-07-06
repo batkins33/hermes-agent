@@ -274,6 +274,13 @@ def test_elevated_gateway_command_uses_pythonw_hidden_console(monkeypatch):
     assert cwd
 
 
+def test_resolve_logon_trigger_user_uses_bare_local_username(monkeypatch):
+    monkeypatch.setenv("USERNAME", "bkat3")
+    monkeypatch.setenv("USERDOMAIN", "WORKGROUP")
+    monkeypatch.setenv("COMPUTERNAME", "TF-HOME")
+    assert gateway_windows._resolve_logon_trigger_user() == "bkat3"
+
+
 def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_path):
     """Install must delete+create so stale minute-repeat task settings are not preserved."""
     calls = []
@@ -282,6 +289,7 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"DOMAIN\\alice")
+    monkeypatch.setattr(gateway_windows, "_resolve_logon_trigger_user", lambda: r"DOMAIN\\alice")
 
     def fake_schtasks(args):
         calls.append(tuple(args))
@@ -310,6 +318,8 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in xml_seen["text"]
     assert "<RestartOnFailure>" in xml_seen["text"]
     assert "<Count>999</Count>" in xml_seen["text"]
+    assert "<UserId>" in xml_seen["text"]
+    assert "alice" in xml_seen["text"]
     # Scheduled Task launches the console-less .vbs via wscript.exe, never cmd.exe
     # (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A).
     assert "<Command>wscript.exe</Command>" in xml_seen["text"]
