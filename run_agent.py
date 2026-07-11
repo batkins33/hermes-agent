@@ -3279,6 +3279,15 @@ class AIAgent:
         session expiry, etc.
         """
         if self._memory_manager:
+            # sync_all() runs on the manager's background worker.  Drain it
+            # before invoking the provider's end hook, otherwise a short CLI
+            # session can reach on_session_end() while the final sync is still
+            # queued; shutdown_all() then cancels that queued sync and the
+            # provider has nothing to flush.
+            try:
+                self._memory_manager.flush_pending(timeout=5.0)
+            except Exception as e:
+                logger.warning("Memory provider final sync drain failed during shutdown: %s", e)
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
@@ -3303,6 +3312,13 @@ class AIAgent:
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
         if self._memory_manager:
+            # See shutdown_memory_provider(): final completed turns may still
+            # be queued on the asynchronous provider worker at this boundary.
+            # Drain before extraction so the provider can include them.
+            try:
+                self._memory_manager.flush_pending(timeout=5.0)
+            except Exception as e:
+                logger.warning("Memory provider final sync drain failed during session commit: %s", e)
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
