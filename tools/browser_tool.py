@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
@@ -249,6 +250,66 @@ def _sanitize_url_for_logs(value: object) -> str:
     cannot drift apart.
     """
     return redact_cdp_url(value)
+
+
+def _normalize_url_for_tab_affinity(url: str) -> str:
+    """Normalize URLs for exact tab matching with narrow equivalence only."""
+    try:
+        parsed = urllib.parse.urlsplit((url or "").strip())
+    except Exception:
+        return (url or "").strip()
+    path = parsed.path or ""
+    if path.endswith("/"):
+        path = path.rstrip("/")
+    return urllib.parse.urlunsplit(parsed._replace(path=path))
+
+
+def _browser_eval_current_url(task_id: str) -> Optional[str]:
+    result = _run_browser_command(task_id, "eval", ["window.location.href"], timeout=5, _engine_override="auto")
+    if not result.get("success"):
+        return None
+    current = result.get("data", {}).get("result", "")
+    if not isinstance(current, str):
+        return None
+    current = current.strip().strip('"').strip("'")
+    return current or None
+
+
+def _browser_tab_affinity_to_url(task_id: str, expected_url: str) -> Dict[str, Any]:
+    expected = _normalize_url_for_tab_affinity(expected_url)
+    active_url = _browser_eval_current_url(task_id)
+    if active_url and _normalize_url_for_tab_affinity(active_url) == expected:
+        return {"status": "matched"}
+
+    tabs_result = _run_browser_command(task_id, "tab list", [], timeout=10, _engine_override="auto")
+    if not tabs_result.get("success"):
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+    tabs = tabs_result.get("data", {}).get("tabs")
+    if not isinstance(tabs, list):
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+
+    match_tab_id = None
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            continue
+        tab_url = tab.get("url")
+        tab_id = tab.get("tabId") or tab.get("id")
+        if isinstance(tab_url, str) and isinstance(tab_id, str):
+            if _normalize_url_for_tab_affinity(tab_url) == expected:
+                match_tab_id = tab_id
+                break
+
+    if not match_tab_id:
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+
+    switch_result = _run_browser_command(task_id, "tab switch", [match_tab_id], timeout=10, _engine_override="auto")
+    if not switch_result.get("success"):
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+
+    verified_url = _browser_eval_current_url(task_id)
+    if verified_url and _normalize_url_for_tab_affinity(verified_url) == expected:
+        return {"status": "switched"}
+    return {"status": "failed", "error": "Browser tab affinity could not be established"}
 
 
 def _get_command_timeout() -> int:
@@ -2852,6 +2913,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                 "error": "Blocked: redirect landed on a private/internal address",
             })
 
+        affinity = {"status": "not-needed"}
+        if not _is_local_backend() and not auto_local_this_nav and not _is_camofox_mode():
+            affinity = _browser_tab_affinity_to_url(nav_session_key, final_url)
+            if affinity.get("status") == "failed":
+                return json.dumps({
+                    "success": False,
+                    "error": "Browser tab affinity could not be established",
+                }, ensure_ascii=False)
+
         response = {
             "success": True,
             "url": final_url,
@@ -2862,6 +2932,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # or snapshots to a newly-created but irrelevant session.
         _last_active_session_key[effective_task_id] = nav_session_key
         _copy_fallback_warning(response, result)
+        if affinity.get("status") == "switched":
+            response["tab_affinity"] = "switched"
 
         # Detect common "blocked" page patterns from title/url
         blocked_patterns = [
