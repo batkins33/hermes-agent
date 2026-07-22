@@ -1,6 +1,7 @@
 """Regression tests for browser tab affinity correction."""
 
 import json
+import threading
 
 from tools import browser_tool
 
@@ -189,11 +190,20 @@ def test_affinity_failure_restores_distinct_owned_previous_binding(monkeypatch):
 def test_successful_navigation_clears_prior_poison(monkeypatch):
     _base_nav_patches(monkeypatch)
     browser_tool._poisoned_task_sessions["task-1"] = "tab_affinity_failed"
+    concurrent_results = []
 
     def fake_run(task_id, command, args=None, timeout=None, _engine_override=None):
         if command == "open":
             return {"success": True, "data": {"title": "Example Domain", "url": "https://example.com/"}}
         if command == "eval":
+            worker = threading.Thread(
+                target=lambda: concurrent_results.append(
+                    json.loads(browser_tool.browser_snapshot(task_id="task-1"))
+                )
+            )
+            worker.start()
+            worker.join(timeout=2)
+            assert not worker.is_alive()
             return {"success": True, "data": {"result": "https://example.com/"}}
         if command == "snapshot":
             return {"success": True, "data": {"snapshot": "example", "refs": {}}}
@@ -203,4 +213,7 @@ def test_successful_navigation_clears_prior_poison(monkeypatch):
     result = json.loads(browser_tool.browser_navigate("https://example.com", task_id="task-1"))
 
     assert result["success"] is True
+    assert concurrent_results
+    assert all(item["success"] is False for item in concurrent_results)
+    assert all("navigate again" in item["error"] for item in concurrent_results)
     assert browser_tool._poisoned_task_sessions == {}
