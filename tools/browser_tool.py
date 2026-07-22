@@ -302,7 +302,9 @@ def _browser_tab_affinity_to_url(task_id: str, expected_url: str) -> Dict[str, A
     if not match_tab_id:
         return {"status": "failed", "error": "Browser tab affinity could not be established"}
 
-    switch_result = _run_browser_command(task_id, "tab switch", [match_tab_id], timeout=10, _engine_override="auto")
+    # agent-browser switches tabs with `tab <tab-id>`; there is no
+    # `tab switch <tab-id>` operation.
+    switch_result = _run_browser_command(task_id, "tab", [match_tab_id], timeout=10, _engine_override="auto")
     if not switch_result.get("success"):
         return {"status": "failed", "error": "Browser tab affinity could not be established"}
 

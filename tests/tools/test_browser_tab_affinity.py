@@ -41,7 +41,7 @@ def test_reused_cdp_daemon_switches_to_matching_tab(monkeypatch):
                     ]
                 },
             }
-        if command == "tab switch":
+        if command == "tab":
             assert args == ["t1"]
             return {"success": True}
         if command == "snapshot":
@@ -54,7 +54,7 @@ def test_reused_cdp_daemon_switches_to_matching_tab(monkeypatch):
     assert result["success"] is True
     assert result["url"] == "https://example.com/"
     assert result["tab_affinity"] == "switched"
-    assert [c[1] for c in calls] == ["open", "eval", "tab list", "tab switch", "eval", "snapshot"]
+    assert [c[1] for c in calls] == ["open", "eval", "tab list", "tab", "eval", "snapshot"]
 
 
 def test_affinity_short_circuits_when_active_url_already_matches(monkeypatch):
