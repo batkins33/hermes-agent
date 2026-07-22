@@ -1463,7 +1463,43 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+_poisoned_task_sessions: Dict[str, str] = {}  # task_id -> non-sensitive reason code
 _LOCAL_SUFFIX = "::local"
+
+
+def _poisoned_task_response(task_id: str) -> Optional[str]:
+    """Return a safe failure for a task whose CDP tab binding is ambiguous."""
+    bare_task_id = _bare_task_id_for_session_key(task_id)
+    if bare_task_id not in _poisoned_task_sessions:
+        return None
+    return json.dumps({
+        "success": False,
+        "error": "Browser session is invalid after a tab-affinity failure; navigate again before using page actions",
+    }, ensure_ascii=False)
+
+
+def _mark_task_affinity_failed(
+    task_id: str,
+    nav_session_key: str,
+    previous_session_key: Optional[str],
+) -> None:
+    """Restore a prior safe binding or poison the task until a new navigation."""
+    with _cleanup_lock:
+        previous_info = (
+            _active_sessions.get(previous_session_key)
+            if previous_session_key and previous_session_key != nav_session_key
+            else None
+        )
+        if (
+            previous_session_key is not None
+            and previous_info
+            and _session_info_owned_by_task(previous_info, task_id, previous_session_key)
+        ):
+            _last_active_session_key[task_id] = previous_session_key
+            _poisoned_task_sessions.pop(task_id, None)
+            return
+        _last_active_session_key.pop(task_id, None)
+        _poisoned_task_sessions[task_id] = "tab_affinity_failed"
 
 # Flag to track if cleanup has been done
 _cleanup_done = False
@@ -2340,6 +2376,10 @@ def _run_browser_command(
     Returns:
         Parsed JSON response from agent-browser
     """
+    if command not in {"open", "close"}:
+        poisoned = _poisoned_task_response(task_id)
+        if poisoned is not None:
+            return {"success": False, "error": json.loads(poisoned)["error"]}
     if timeout is None:
         timeout = _safe_command_timeout()
     args = args or []
@@ -2860,6 +2900,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             type(_get_cloud_provider()).__name__ if _get_cloud_provider() else "none",
         )
 
+    # A successful explicit navigation is the only operation that can recover
+    # a task poisoned by an earlier ambiguous CDP tab binding. Preserve the
+    # previous binding so an affinity failure can restore it when it points to
+    # a distinct, still-owned session.
+    previous_session_key = _last_active_session_key.get(effective_task_id)
+    prior_poison = _poisoned_task_sessions.get(effective_task_id)
+
     # Get session info to check if this is a new session
     # (will create one with features logged if not exists)
     session_info = _get_session_info(nav_session_key)
@@ -2915,10 +2962,19 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                 "error": "Blocked: redirect landed on a private/internal address",
             })
 
+        # The open completed and redirect guards passed. Allow the affinity
+        # probe to run; any failure below immediately re-poisons or restores
+        # the task binding before returning.
+        if prior_poison is not None:
+            _poisoned_task_sessions.pop(effective_task_id, None)
+
         affinity = {"status": "not-needed"}
         if not _is_local_backend() and not auto_local_this_nav and not _is_camofox_mode():
             affinity = _browser_tab_affinity_to_url(nav_session_key, final_url)
             if affinity.get("status") == "failed":
+                _mark_task_affinity_failed(
+                    effective_task_id, nav_session_key, previous_session_key,
+                )
                 return json.dumps({
                     "success": False,
                     "error": "Browser tab affinity could not be established",
@@ -3010,6 +3066,10 @@ def browser_snapshot(
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
+
+    poisoned = _poisoned_task_response(task_id or "default")
+    if poisoned is not None:
+        return poisoned
 
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -3356,6 +3416,11 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    if not _is_camofox_mode():
+        poisoned = _poisoned_task_response(task_id or "default")
+        if poisoned is not None:
+            return poisoned
+
     # --- JS evaluation mode ---
     if expression is not None:
         policy_error = _enforce_browser_eval_policy(expression)
@@ -4354,6 +4419,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
             _last_active_session_key.pop(bare_task_id, None)
     else:
         _last_active_session_key.pop(bare_task_id, None)
+    _poisoned_task_sessions.pop(bare_task_id, None)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:

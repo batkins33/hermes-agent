@@ -10,6 +10,7 @@ def _base_nav_patches(monkeypatch):
     monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
     monkeypatch.setattr(browser_tool, "_navigation_session_key", lambda task_id, url: task_id)
     monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
+    monkeypatch.setattr(browser_tool, "_poisoned_task_sessions", {})
     monkeypatch.setattr(browser_tool, "_get_session_info", lambda key: {"_first_nav": True})
     monkeypatch.setattr(browser_tool, "_maybe_start_recording", lambda key: None)
     monkeypatch.setattr(browser_tool, "_get_open_command_timeout", lambda first_open=False: 1)
@@ -95,6 +96,10 @@ def test_no_matching_tab_returns_safe_failure(monkeypatch):
     assert result["success"] is False
     assert "snapshot" not in result
     assert "affinity" in result["error"].lower()
+    assert browser_tool._poisoned_task_sessions == {"task-1": "tab_affinity_failed"}
+    follow_up = json.loads(browser_tool.browser_snapshot(task_id="task-1"))
+    assert follow_up["success"] is False
+    assert "navigate again" in follow_up["error"]
 
 
 def test_malformed_tab_list_or_failed_switch_returns_safe_failure(monkeypatch):
@@ -121,6 +126,7 @@ def test_local_behavior_unchanged(monkeypatch):
     monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
     monkeypatch.setattr(browser_tool, "_navigation_session_key", lambda task_id, url: task_id)
     monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
+    monkeypatch.setattr(browser_tool, "_poisoned_task_sessions", {})
     monkeypatch.setattr(browser_tool, "_get_session_info", lambda key: {"_first_nav": True})
     monkeypatch.setattr(browser_tool, "_maybe_start_recording", lambda key: None)
     monkeypatch.setattr(browser_tool, "_get_open_command_timeout", lambda first_open=False: 1)
@@ -153,3 +159,48 @@ def test_url_normalization_is_narrow():
     assert browser_tool._normalize_url_for_tab_affinity("https://a.test/path") == "https://a.test/path"
     assert browser_tool._normalize_url_for_tab_affinity("https://a.test/other") != browser_tool._normalize_url_for_tab_affinity("https://a.test/path")
     assert browser_tool._normalize_url_for_tab_affinity("https://b.test/path") != browser_tool._normalize_url_for_tab_affinity("https://a.test/path")
+
+
+def test_affinity_failure_restores_distinct_owned_previous_binding(monkeypatch):
+    _base_nav_patches(monkeypatch)
+    previous_key = "task-1::previous"
+    browser_tool._last_active_session_key["task-1"] = previous_key
+    monkeypatch.setattr(browser_tool, "_active_sessions", {
+        previous_key: {"owner_task_id": "task-1", "session_key": previous_key},
+    })
+
+    def fake_run(task_id, command, args=None, timeout=None, _engine_override=None):
+        if command == "open":
+            return {"success": True, "data": {"title": "Example Domain", "url": "https://example.com/"}}
+        if command == "eval":
+            return {"success": True, "data": {"result": "https://www.google.com/"}}
+        if command == "tab list":
+            return {"success": True, "data": {"tabs": []}}
+        raise AssertionError(command)
+
+    monkeypatch.setattr(browser_tool, "_run_browser_command", fake_run)
+    result = json.loads(browser_tool.browser_navigate("https://example.com", task_id="task-1"))
+
+    assert result["success"] is False
+    assert browser_tool._last_active_session_key["task-1"] == previous_key
+    assert browser_tool._poisoned_task_sessions == {}
+
+
+def test_successful_navigation_clears_prior_poison(monkeypatch):
+    _base_nav_patches(monkeypatch)
+    browser_tool._poisoned_task_sessions["task-1"] = "tab_affinity_failed"
+
+    def fake_run(task_id, command, args=None, timeout=None, _engine_override=None):
+        if command == "open":
+            return {"success": True, "data": {"title": "Example Domain", "url": "https://example.com/"}}
+        if command == "eval":
+            return {"success": True, "data": {"result": "https://example.com/"}}
+        if command == "snapshot":
+            return {"success": True, "data": {"snapshot": "example", "refs": {}}}
+        raise AssertionError(command)
+
+    monkeypatch.setattr(browser_tool, "_run_browser_command", fake_run)
+    result = json.loads(browser_tool.browser_navigate("https://example.com", task_id="task-1"))
+
+    assert result["success"] is True
+    assert browser_tool._poisoned_task_sessions == {}
