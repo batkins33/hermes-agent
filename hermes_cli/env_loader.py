@@ -209,6 +209,34 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _paperclip_child_auth_snapshot() -> tuple[bool, str | None]:
+    """Capture run-scoped auth before any dotenv or managed-env loading.
+
+    Paperclip launches Hermes with a short-lived run JWT in ``PAPERCLIP_API_KEY``.
+    Hermes normally gives dotenv files precedence over the shell, which is correct
+    for interactive Hermes but unsafe for a Paperclip child: the persistent
+    ``codex-home`` credential can replace the run identity.  The run marker is the
+    narrow boundary that selects child behavior.
+    """
+    is_paperclip_child = bool(os.environ.get("PAPERCLIP_RUN_ID"))
+    incoming_api_key = os.environ.get("PAPERCLIP_API_KEY") if is_paperclip_child else None
+    if is_paperclip_child:
+        # Never allow the signing secret to cross the Paperclip child boundary.
+        os.environ.pop("PAPERCLIP_AGENT_JWT_SECRET", None)
+    return is_paperclip_child, incoming_api_key
+
+
+def _restore_paperclip_child_auth(is_paperclip_child: bool, incoming_api_key: str | None) -> None:
+    """Reassert the Paperclip child auth boundary after all env sources run."""
+    if not is_paperclip_child:
+        return
+    if incoming_api_key is None:
+        os.environ.pop("PAPERCLIP_API_KEY", None)
+    else:
+        os.environ["PAPERCLIP_API_KEY"] = incoming_api_key
+    os.environ.pop("PAPERCLIP_AGENT_JWT_SECRET", None)
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -221,7 +249,11 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+    - Paperclip children (identified by ``PAPERCLIP_RUN_ID``) retain the
+      incoming run-scoped ``PAPERCLIP_API_KEY`` and never retain the signing
+      secret, while normal Hermes sessions keep the behavior above.
     """
+    is_paperclip_child, incoming_api_key = _paperclip_child_auth_snapshot()
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -244,6 +276,7 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+    _restore_paperclip_child_auth(is_paperclip_child, incoming_api_key)
 
     return loaded
 
