@@ -12683,6 +12683,12 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def cmd_paperclip_identity_probe(args):
+    from hermes_cli.paperclip_identity_probe import run
+
+    return run(args)
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -12729,6 +12735,16 @@ def main():
 
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
+
+    paperclip_identity_probe_parser = subparsers.add_parser(
+        "paperclip-identity-probe",
+        help="Emit a safe receipt for a Paperclip child identity check",
+    )
+    paperclip_identity_probe_parser.add_argument("--api-url", required=True)
+    paperclip_identity_probe_parser.add_argument("--expected-agent-id", required=True)
+    paperclip_identity_probe_parser.add_argument("--expected-issue-id", required=True)
+    paperclip_identity_probe_parser.add_argument("--expected-issue-identifier", required=True)
+    paperclip_identity_probe_parser.set_defaults(func=cmd_paperclip_identity_probe)
 
     # =========================================================================
     # model command  (parser built in hermes_cli/subcommands/model.py)
