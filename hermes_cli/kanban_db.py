@@ -5401,6 +5401,195 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+# --- worktree reaping ---------------------------------------------------
+# Completing a task deliberately LEAVES its worktree behind: _cleanup_workspace
+# removes only 'scratch' workspaces and preserves 'worktree'/'dir' by design, so
+# a human can harvest the branch afterwards.
+#
+# That retention has never had a counterbalance. Nothing removes a preserved
+# worktree, ever, so the population only grows: 172 worktrees (~64 GB) had to be
+# cleared by hand on 2026-07-31, and the same sprawl regenerated to 85 within
+# four days at roughly 21 new tasks/day. Preservation-by-default is right;
+# preservation-forever is what is wrong.
+#
+# reap_stale_worktrees() is the counterbalance, and it is deliberately NOT wired
+# into _cleanup_workspace. Making directory deletion a side effect of completing
+# some *other* task would be a surprise, and this removes directories. It is an
+# explicit call, dry-run by default, and every refusal is reported with a reason
+# instead of being silently skipped.
+#
+# It removes the worktree DIRECTORY only and never the branch. The directory is
+# the disk cost; the branch is a ref that costs nothing and is what makes the
+# work recoverable. Deleting both would turn a space reclaim into data loss.
+WORKTREE_REAP_AFTER_DAYS = 14
+
+_REAP_TERMINAL_STATUSES = ("done", "archived", "failed", "cancelled")
+
+
+def _git_worktree_is_clean(path: Path) -> Optional[bool]:
+    """True/False when determinable, None when git could not answer.
+
+    The caller must treat None as "not clean": an unreadable worktree is not
+    evidence of safety.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return not (result.stdout or "").strip()
+
+
+def _git_commits_not_on_any_remote(path: Path) -> Optional[int]:
+    """Count commits reachable from HEAD that exist on no remote-tracking ref.
+
+    0 means every commit here is also on a remote, so removing the worktree
+    cannot lose history. None means git could not answer, which the caller must
+    treat as unsafe rather than as zero.
+
+    Deliberately not an upstream/``@{u}`` comparison: a kanban task branch often
+    has no upstream configured at all, and "no upstream" is precisely the
+    dangerous case rather than a neutral one.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-list", "--count", "HEAD", "--not", "--remotes"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int((result.stdout or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def reap_stale_worktrees(
+    conn: sqlite3.Connection,
+    *,
+    older_than_days: Optional[int] = None,
+    dry_run: bool = True,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Remove worktree directories of long-finished tasks, when provably safe.
+
+    Every gate below must pass or the worktree is left alone and the reason
+    recorded. Uncertainty always counts as unsafe — a git command that fails to
+    answer blocks the reap rather than being read as "nothing there".
+
+    * the task is terminal (done/archived/failed/cancelled)
+    * it completed more than *older_than_days* ago (default
+      :data:`WORKTREE_REAP_AFTER_DAYS`)
+    * workspace_kind is exactly 'worktree' — scratch/dir are none of this
+      function's business
+    * no non-terminal child task still depends on the workspace
+    * the working tree is clean; uncommitted work is never reaped, and the skip
+      reason points at the preserve tooling
+    * every commit is already on some remote, so nothing unpushed is lost
+
+    Returns a report: ``{"reaped": [...], "skipped": [...], "dry_run": bool,
+    "cutoff": int}``. Callers should print it; nothing here writes to stdout.
+    """
+    days = WORKTREE_REAP_AFTER_DAYS if older_than_days is None else int(older_than_days)
+    cutoff = int(time.time()) - days * 86400
+    reaped: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    placeholders = ",".join("?" for _ in _REAP_TERMINAL_STATUSES)
+    rows = conn.execute(
+        "SELECT id, workspace_path, branch_name, completed_at, status "
+        "  FROM tasks "
+        f" WHERE workspace_kind = 'worktree' AND workspace_path IS NOT NULL "
+        f"   AND status IN ({placeholders}) "
+        "   AND completed_at IS NOT NULL AND completed_at < ? "
+        " ORDER BY completed_at ASC",
+        (*_REAP_TERMINAL_STATUSES, cutoff),
+    ).fetchall()
+
+    def _skip(row, reason: str) -> None:
+        skipped.append({
+            "task_id": row["id"],
+            "path": row["workspace_path"],
+            "branch": row["branch_name"],
+            "reason": reason,
+        })
+
+    for row in rows:
+        if limit is not None and len(reaped) >= limit:
+            break
+        path = Path(str(row["workspace_path"])).expanduser()
+
+        if not path.is_dir():
+            # Already gone from disk. Nothing to reclaim, and not an error.
+            _skip(row, "path no longer exists")
+            continue
+
+        active_child = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks t ON t.id = l.child_id "
+            f"WHERE l.parent_id = ? AND t.status NOT IN ({placeholders}) LIMIT 1",
+            (row["id"], *_REAP_TERMINAL_STATUSES),
+        ).fetchone()
+        if active_child:
+            _skip(row, "a non-terminal child task still needs this workspace")
+            continue
+
+        clean = _git_worktree_is_clean(path)
+        if clean is None:
+            _skip(row, "git could not report status (unreadable worktree) — refusing to guess")
+            continue
+        if not clean:
+            _skip(row, "uncommitted work present — preserve it first "
+                       "(deploy/health/preserve-worktree-work.sh in agent-systems-hub)")
+            continue
+
+        unpushed = _git_commits_not_on_any_remote(path)
+        if unpushed is None:
+            _skip(row, "git could not determine whether commits are on a remote — refusing to guess")
+            continue
+        if unpushed > 0:
+            _skip(row, f"{unpushed} commit(s) exist on no remote — pushing would be lost work")
+            continue
+
+        if dry_run:
+            reaped.append({"task_id": row["id"], "path": str(path),
+                           "branch": row["branch_name"], "removed": False})
+            continue
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), "worktree", "remove", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed reap must not abort the sweep
+            _skip(row, f"git worktree remove raised: {type(exc).__name__}")
+            continue
+        if result.returncode != 0:
+            _skip(row, f"git worktree remove failed: {(result.stderr or '').strip()[:160]}")
+            continue
+
+        _log.info("reaped worktree for task %s: %s", row["id"], path)
+        reaped.append({"task_id": row["id"], "path": str(path),
+                       "branch": row["branch_name"], "removed": True})
+
+    return {"reaped": reaped, "skipped": skipped, "dry_run": dry_run, "cutoff": cutoff}
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
