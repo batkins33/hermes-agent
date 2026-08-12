@@ -5425,6 +5425,19 @@ WORKTREE_REAP_AFTER_DAYS = 14
 
 _REAP_TERMINAL_STATUSES = ("done", "archived", "failed", "cancelled")
 
+# Both kinds that _cleanup_workspace preserves are in scope, not just 'worktree'.
+# The first version of this reaper filtered on workspace_kind='worktree' because
+# that is what the thing is called. Measured against the live board that was
+# wrong: 295 of 302 tasks are kind='dir' and only 2 are 'worktree', so the reaper
+# matched 0 rows and was silently inert. The on-disk t_<hex> directories that
+# make up the actual sprawl are all recorded as 'dir'.
+#
+# Kind is therefore not a reliable signal of what is on disk, and this function
+# no longer treats it as one: eligibility comes from the kind being one that
+# _cleanup_workspace leaves behind, and what to DO with the path is decided by
+# inspecting the path itself.
+_REAP_ELIGIBLE_KINDS = ("worktree", "dir")
+
 
 def _git_worktree_is_clean(path: Path) -> Optional[bool]:
     """True/False when determinable, None when git could not answer.
@@ -5492,8 +5505,15 @@ def reap_stale_worktrees(
     * the task is terminal (done/archived/failed/cancelled)
     * it completed more than *older_than_days* ago (default
       :data:`WORKTREE_REAP_AFTER_DAYS`)
-    * workspace_kind is exactly 'worktree' — scratch/dir are none of this
-      function's business
+    * workspace_kind is one _cleanup_workspace preserves ('worktree' or 'dir');
+      'scratch' is already removed on completion and is not this function's
+      business
+    * the path is a LINKED GIT WORKTREE. A plain directory is skipped with a
+      reason, never deleted: removing one needs ``shutil.rmtree`` and therefore
+      the containment guard that ``_is_managed_scratch_path`` exists to provide
+      (see #28818, where completion silently deleted a user's source tree).
+      That is a separate decision, deliberately not taken here — on the live
+      board 88 of 102 eligible rows are plain directories.
     * no non-terminal child task still depends on the workspace
     * the working tree is clean; uncommitted work is never reaped, and the skip
       reason points at the preserve tooling
@@ -5508,14 +5528,15 @@ def reap_stale_worktrees(
     skipped: list[dict[str, Any]] = []
 
     placeholders = ",".join("?" for _ in _REAP_TERMINAL_STATUSES)
+    kind_placeholders = ",".join("?" for _ in _REAP_ELIGIBLE_KINDS)
     rows = conn.execute(
-        "SELECT id, workspace_path, branch_name, completed_at, status "
+        "SELECT id, workspace_path, branch_name, completed_at, status, workspace_kind "
         "  FROM tasks "
-        f" WHERE workspace_kind = 'worktree' AND workspace_path IS NOT NULL "
+        f" WHERE workspace_kind IN ({kind_placeholders}) AND workspace_path IS NOT NULL "
         f"   AND status IN ({placeholders}) "
         "   AND completed_at IS NOT NULL AND completed_at < ? "
         " ORDER BY completed_at ASC",
-        (*_REAP_TERMINAL_STATUSES, cutoff),
+        (*_REAP_ELIGIBLE_KINDS, *_REAP_TERMINAL_STATUSES, cutoff),
     ).fetchall()
 
     def _skip(row, reason: str) -> None:
@@ -5534,6 +5555,23 @@ def reap_stale_worktrees(
         if not path.is_dir():
             # Already gone from disk. Nothing to reclaim, and not an error.
             _skip(row, "path no longer exists")
+            continue
+
+        # Decide from the PATH, not from workspace_kind. Kind turned out to be a
+        # poor proxy for what is on disk -- the live board records the same
+        # t_<hex> git worktrees as 'dir' -- so this asks git directly.
+        #
+        # A linked worktree has a .git FILE pointing at the real gitdir; a normal
+        # clone has a .git DIRECTORY. Only the former can be handed to
+        # `git worktree remove`. Anything else is skipped rather than deleted:
+        # removing a plain directory means shutil.rmtree, which needs the
+        # containment guard _is_managed_scratch_path provides (#28818, where
+        # completion silently rmtree'd a user's source tree). Widening this
+        # function to do that is a separate decision with a much larger blast
+        # radius -- on the live board 88 of 102 eligible rows land here.
+        if not (path / ".git").is_file():
+            _skip(row, "not a linked git worktree (plain directory) — removal would need "
+                       "rmtree plus a containment guard; out of scope for this function")
             continue
 
         active_child = conn.execute(
