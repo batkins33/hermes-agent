@@ -1463,6 +1463,7 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+_poisoned_task_sessions: Dict[str, str] = {}  # task_id -> failure reason
 _LOCAL_SUFFIX = "::local"
 
 # Flag to track if cleanup has been done
