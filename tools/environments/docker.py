@@ -1056,12 +1056,18 @@ class DockerEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None,
+                  env: dict[str, str] | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
         cmd = [self._docker_exe, "exec"]
         if stdin_data is not None:
             cmd.append("-i")
+        if env:
+            for key, value in env.items():
+                if not key:
+                    continue
+                cmd.extend(["-e", f"{key}={'' if value is None else str(value)}"])
 
         # Only inject -e env args during init_session (login=True).
         # Subsequent commands get env vars from the snapshot.

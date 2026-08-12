@@ -54,6 +54,10 @@ pip install httpx
 - `templates/database_server.py` - read-only SQLite query server
 - `templates/file_processor.py` - text-file inspection and search server
 
+### Examples
+
+- `examples/mcp_bridge_example.py` - a reference bridge script that can run as a FastMCP server or in one-shot process mode
+
 ### Scripts
 
 - `scripts/scaffold_fastmcp.py` - copy a starter template and replace the server name placeholder

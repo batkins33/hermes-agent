@@ -1898,6 +1898,18 @@ def list_authenticated_providers(
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
+        # Use the generic status dispatcher for non-registry providers such
+        # as Vertex, whose ADC credentials intentionally live outside the
+        # API-key/OAuth store.
+        if not _cp_has_creds:
+            try:
+                from hermes_cli.auth import get_auth_status
+                _cp_status = get_auth_status(_cp.slug)
+                _cp_has_creds = bool(
+                    _cp_status.get("logged_in") or _cp_status.get("configured")
+                )
+            except Exception:
+                pass
         # Also check auth store and credential pool
         if not _cp_has_creds:
             try:

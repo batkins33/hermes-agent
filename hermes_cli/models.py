@@ -177,6 +177,13 @@ def _xai_curated_models() -> list[str]:
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "moa": ["default"],
+    # Vertex exposes no compatible /models discovery endpoint. Keep the
+    # supported Gemini preview IDs curated so every picker surface can show
+    # the same choices as the Vertex setup flow.
+    "vertex": [
+        "google/gemini-3-pro-preview",
+        "google/gemini-3-flash-preview",
+    ],
     "nous": [
         # Anthropic
         "anthropic/claude-fable-5",

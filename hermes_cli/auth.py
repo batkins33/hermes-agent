@@ -6108,6 +6108,18 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
+    if target == "vertex":
+        try:
+            from agent.vertex_adapter import has_vertex_credentials
+            configured = has_vertex_credentials()
+            return {
+                "logged_in": configured,
+                "configured": configured,
+                "provider": "vertex",
+                "auth_type": "gcp_adc",
+            }
+        except Exception as exc:
+            return {"logged_in": False, "configured": False, "provider": "vertex", "error": str(exc)}
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":

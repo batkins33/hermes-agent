@@ -134,7 +134,7 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
 
 
 def _popen_bash(
-    cmd: list[str], stdin_data: str | None = None, **kwargs
+    cmd: list[str], stdin_data: str | None = None, env: dict[str, str] | None = None, **kwargs
 ) -> subprocess.Popen:
     """Spawn a subprocess with standard stdout/stderr/stdin setup.
 
@@ -148,6 +148,7 @@ def _popen_bash(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+        env=env,
         text=True,
         **kwargs,
     )
@@ -333,6 +334,7 @@ class BaseEnvironment(ABC):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*.
 
@@ -893,9 +895,14 @@ class BaseEnvironment(ABC):
         *,
         timeout: int | None = None,
         stdin_data: str | None = None,
+        env: dict[str, str] | None = None,
         rewrite_compound_background: bool = True,
     ) -> dict:
-        """Execute a command, return {"output": str, "returncode": int}."""
+        """Execute a command, return {"output": str, "returncode": int}.
+
+        ``stdin_data`` is written to the child process's standard input.
+        ``env`` is merged into the child process environment for the call.
+        """
         self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
@@ -927,7 +934,11 @@ class BaseEnvironment(ABC):
         login = not self._snapshot_ready
 
         proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+            wrapped,
+            login=login,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
+            env=env,
         )
         result = self._wait_for_process(proc, timeout=effective_timeout)
         self._update_cwd(result)
