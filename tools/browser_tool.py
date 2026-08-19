@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
@@ -249,6 +250,68 @@ def _sanitize_url_for_logs(value: object) -> str:
     cannot drift apart.
     """
     return redact_cdp_url(value)
+
+
+def _normalize_url_for_tab_affinity(url: str) -> str:
+    """Normalize URLs for exact tab matching with narrow equivalence only."""
+    try:
+        parsed = urllib.parse.urlsplit((url or "").strip())
+    except Exception:
+        return (url or "").strip()
+    path = parsed.path or ""
+    if path.endswith("/"):
+        path = path.rstrip("/")
+    return urllib.parse.urlunsplit(parsed._replace(path=path))
+
+
+def _browser_eval_current_url(task_id: str) -> Optional[str]:
+    result = _run_browser_command(task_id, "eval", ["window.location.href"], timeout=5, _engine_override="auto")
+    if not result.get("success"):
+        return None
+    current = result.get("data", {}).get("result", "")
+    if not isinstance(current, str):
+        return None
+    current = current.strip().strip('"').strip("'")
+    return current or None
+
+
+def _browser_tab_affinity_to_url(task_id: str, expected_url: str) -> Dict[str, Any]:
+    expected = _normalize_url_for_tab_affinity(expected_url)
+    active_url = _browser_eval_current_url(task_id)
+    if active_url and _normalize_url_for_tab_affinity(active_url) == expected:
+        return {"status": "matched"}
+
+    tabs_result = _run_browser_command(task_id, "tab list", [], timeout=10, _engine_override="auto")
+    if not tabs_result.get("success"):
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+    tabs = tabs_result.get("data", {}).get("tabs")
+    if not isinstance(tabs, list):
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+
+    match_tab_id = None
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            continue
+        tab_url = tab.get("url")
+        tab_id = tab.get("tabId") or tab.get("id")
+        if isinstance(tab_url, str) and isinstance(tab_id, str):
+            if _normalize_url_for_tab_affinity(tab_url) == expected:
+                match_tab_id = tab_id
+                break
+
+    if not match_tab_id:
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+
+    # agent-browser switches tabs with `tab <tab-id>`; there is no
+    # `tab switch <tab-id>` operation.
+    switch_result = _run_browser_command(task_id, "tab", [match_tab_id], timeout=10, _engine_override="auto")
+    if not switch_result.get("success"):
+        return {"status": "failed", "error": "Browser tab affinity could not be established"}
+
+    verified_url = _browser_eval_current_url(task_id)
+    if verified_url and _normalize_url_for_tab_affinity(verified_url) == expected:
+        return {"status": "switched"}
+    return {"status": "failed", "error": "Browser tab affinity could not be established"}
 
 
 def _get_command_timeout() -> int:
@@ -1400,7 +1463,46 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+_poisoned_task_sessions: Dict[str, str] = {}  # task_id -> non-sensitive reason code
+_poison_bypass = threading.local()  # internal affinity probes only; never shared across threads
 _LOCAL_SUFFIX = "::local"
+
+
+def _poisoned_task_response(task_id: str) -> Optional[str]:
+    """Return a safe failure for a task whose CDP tab binding is ambiguous."""
+    if getattr(_poison_bypass, "allow", False):
+        return None
+    bare_task_id = _bare_task_id_for_session_key(task_id)
+    if bare_task_id not in _poisoned_task_sessions:
+        return None
+    return json.dumps({
+        "success": False,
+        "error": "Browser session is invalid after a tab-affinity failure; navigate again before using page actions",
+    }, ensure_ascii=False)
+
+
+def _mark_task_affinity_failed(
+    task_id: str,
+    nav_session_key: str,
+    previous_session_key: Optional[str],
+) -> None:
+    """Restore a prior safe binding or poison the task until a new navigation."""
+    with _cleanup_lock:
+        previous_info = (
+            _active_sessions.get(previous_session_key)
+            if previous_session_key and previous_session_key != nav_session_key
+            else None
+        )
+        if (
+            previous_session_key is not None
+            and previous_info
+            and _session_info_owned_by_task(previous_info, task_id, previous_session_key)
+        ):
+            _last_active_session_key[task_id] = previous_session_key
+            _poisoned_task_sessions.pop(task_id, None)
+            return
+        _last_active_session_key.pop(task_id, None)
+        _poisoned_task_sessions[task_id] = "tab_affinity_failed"
 
 # Flag to track if cleanup has been done
 _cleanup_done = False
@@ -2277,6 +2379,10 @@ def _run_browser_command(
     Returns:
         Parsed JSON response from agent-browser
     """
+    if command not in {"open", "close"}:
+        poisoned = _poisoned_task_response(task_id)
+        if poisoned is not None:
+            return {"success": False, "error": json.loads(poisoned)["error"]}
     if timeout is None:
         timeout = _safe_command_timeout()
     args = args or []
@@ -2797,6 +2903,18 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             type(_get_cloud_provider()).__name__ if _get_cloud_provider() else "none",
         )
 
+    # A successful explicit navigation is the only operation that can recover
+    # a task poisoned by an earlier ambiguous CDP tab binding. Preserve the
+    # previous binding so an affinity failure can restore it when it points to
+    # a distinct, still-owned session.
+    previous_session_key = _last_active_session_key.get(effective_task_id)
+    affinity_required = not _is_local_backend() and not auto_local_this_nav
+    if affinity_required:
+        # Block concurrent page actions from the start of a remote navigation
+        # until its active tab has been verified and the new binding is committed.
+        with _cleanup_lock:
+            _poisoned_task_sessions[effective_task_id] = "navigation_in_progress"
+
     # Get session info to check if this is a new session
     # (will create one with features logged if not exists)
     session_info = _get_session_info(nav_session_key)
@@ -2834,6 +2952,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             and _is_always_blocked_url(final_url)
         ):
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
+            if affinity_required:
+                _mark_task_affinity_failed(
+                    effective_task_id, nav_session_key, previous_session_key,
+                )
             return json.dumps({
                 "success": False,
                 "error": "Blocked: redirect landed on a cloud metadata endpoint",
@@ -2847,10 +2969,38 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         ):
             # Navigate away to a blank page to prevent snapshot leaks
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
+            if affinity_required:
+                _mark_task_affinity_failed(
+                    effective_task_id, nav_session_key, previous_session_key,
+                )
             return json.dumps({
                 "success": False,
                 "error": "Blocked: redirect landed on a private/internal address",
             })
+
+        affinity = {"status": "not-needed"}
+        if affinity_required:
+            previous_bypass = getattr(_poison_bypass, "allow", False)
+            _poison_bypass.allow = True
+            try:
+                affinity = _browser_tab_affinity_to_url(nav_session_key, final_url)
+            finally:
+                _poison_bypass.allow = previous_bypass
+            if affinity.get("status") == "failed":
+                _mark_task_affinity_failed(
+                    effective_task_id, nav_session_key, previous_session_key,
+                )
+                return json.dumps({
+                    "success": False,
+                    "error": "Browser tab affinity could not be established",
+                }, ensure_ascii=False)
+
+        # Commit the new task binding and lift the fail-closed guard atomically.
+        # A concurrent page action therefore observes either the old poisoned
+        # state or the fully verified new binding, never the recovery window.
+        with _cleanup_lock:
+            _last_active_session_key[effective_task_id] = nav_session_key
+            _poisoned_task_sessions.pop(effective_task_id, None)
 
         response = {
             "success": True,
@@ -2860,8 +3010,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Remember only a successful, non-blocked navigation as the task owner.
         # Failed opens and blocked redirects must not retarget follow-up clicks
         # or snapshots to a newly-created but irrelevant session.
-        _last_active_session_key[effective_task_id] = nav_session_key
         _copy_fallback_warning(response, result)
+        if affinity.get("status") == "switched":
+            response["tab_affinity"] = "switched"
 
         # Detect common "blocked" page patterns from title/url
         blocked_patterns = [
@@ -2911,9 +3062,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(response, ensure_ascii=False)
     else:
+        if affinity_required:
+            _mark_task_affinity_failed(
+                effective_task_id, nav_session_key, previous_session_key,
+            )
         return json.dumps({
             "success": False,
-            "error": result.get("error", "Navigation failed")
+            "error": result.get("error", "Navigation failed"),
         }, ensure_ascii=False)
 
 
@@ -2936,6 +3091,10 @@ def browser_snapshot(
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
+
+    poisoned = _poisoned_task_response(task_id or "default")
+    if poisoned is not None:
+        return poisoned
 
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -3282,6 +3441,11 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    if not _is_camofox_mode():
+        poisoned = _poisoned_task_response(task_id or "default")
+        if poisoned is not None:
+            return poisoned
+
     # --- JS evaluation mode ---
     if expression is not None:
         policy_error = _enforce_browser_eval_policy(expression)
@@ -4280,6 +4444,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
             _last_active_session_key.pop(bare_task_id, None)
     else:
         _last_active_session_key.pop(bare_task_id, None)
+    _poisoned_task_sessions.pop(bare_task_id, None)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:

@@ -35,6 +35,9 @@ class TestPreNavigationSsrf:
         monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
         monkeypatch.setattr(browser_tool, "check_website_access", lambda url: None)
         monkeypatch.setattr(
+            browser_tool, "_browser_tab_affinity_to_url", lambda *a, **kw: {"status": "active"},
+        )
+        monkeypatch.setattr(
             browser_tool,
             "_get_session_info",
             lambda task_id: {
@@ -238,6 +241,9 @@ class TestPostRedirectSsrf:
         """Shared patches for redirect tests."""
         monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
         monkeypatch.setattr(browser_tool, "check_website_access", lambda url: None)
+        monkeypatch.setattr(
+            browser_tool, "_browser_tab_affinity_to_url", lambda *a, **kw: {"status": "active"},
+        )
         monkeypatch.setattr(
             browser_tool,
             "_get_session_info",
