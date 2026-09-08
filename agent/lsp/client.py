@@ -206,6 +206,9 @@ class LSPClient:
         self._initialize_result: Optional[Dict[str, Any]] = None
         self._sync_kind: int = 1  # 1=Full, 2=Incremental
         self._stopping: bool = False
+        # Lifecycle evidence for the manager's reaper / status output.
+        self.created_at: Optional[float] = None
+        self.last_shutdown_forced: bool = False
 
         # Push event for waiters.
         self._push_event = asyncio.Event()
@@ -225,6 +228,47 @@ class LSPClient:
     @property
     def state(self) -> str:
         return self._state
+
+    @property
+    def pid(self) -> Optional[int]:
+        """OS pid of the server process, or None when not spawned."""
+        proc = self._proc
+        return proc.pid if proc is not None else None
+
+    def memory_usage(self) -> Dict[str, Optional[int]]:
+        """Cheap RSS/swap sample from ``/proc/<pid>/status`` (kB).
+
+        Returns ``{"rss_kb": None, "swap_kb": None}`` anywhere ``/proc``
+        is unavailable or the process is gone.  Never raises.
+        """
+        out: Dict[str, Optional[int]] = {"rss_kb": None, "swap_kb": None}
+        pid = self.pid
+        if pid is None:
+            return out
+        try:
+            with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        out["rss_kb"] = int(line.split()[1])
+                    elif line.startswith("VmSwap:"):
+                        out["swap_kb"] = int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return out
+
+    async def kill_now(self) -> None:
+        """Escalate straight to SIGKILL.  Used by the manager when a
+        graceful :meth:`shutdown` overran its budget.  Idempotent."""
+        self._stopping = True
+        self._state = "stopped"
+        proc = self._proc
+        if proc is not None and proc.returncode is None:
+            self.last_shutdown_forced = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await self._cleanup_process()
 
     async def start(self) -> None:
         """Spawn the server and complete the initialize handshake.
@@ -280,6 +324,8 @@ class LSPClient:
                 cwd=self._cwd,
                 start_new_session=True,
             )
+            import time as _time
+            self.created_at = _time.time()
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
@@ -454,6 +500,7 @@ class LSPClient:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
+                    self.last_shutdown_forced = True
                     try:
                         proc.kill()
                         await proc.wait()

@@ -55,6 +55,7 @@ _announced_active: set = set()        # keys: (server_id, workspace_root)
 _announced_unavailable: set = set()   # keys: (server_id, binary_path_or_name)
 _announced_no_root: set = set()       # keys: (server_id, file_path)
 _announced_no_server: set = set()     # keys: (server_id,)
+_announced_limit: set = set()         # keys: (server_id, workspace_root)
 
 
 def _short_path(file_path: str) -> str:
@@ -188,6 +189,64 @@ def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) ->
     )
 
 
+def log_reaped(
+    server_id: str,
+    workspace_root: str,
+    idle_seconds: float,
+    *,
+    forced: bool,
+    reason: str,
+) -> None:
+    """A client was reclaimed by the lifecycle reaper (``reason="idle"``)
+    or evicted to make room under a concurrency cap (``reason="limit"``).
+    INFO every time — reclaims are rare and are exactly what someone
+    diagnosing memory pressure wants to grep for.  Forced terminations
+    (graceful shutdown failed) are WARNING.
+
+    Also re-arms the once-per-key ``active for`` announcement so a
+    re-spawn after reaping is visible again.
+    """
+    with _announce_lock:
+        _announced_active.discard((server_id, workspace_root))
+    level = logging.WARNING if forced else logging.INFO
+    how = "SIGKILL (graceful shutdown failed)" if forced else "graceful"
+    _emit(
+        server_id,
+        level,
+        f"reaped ({reason}, {how}) after {idle_seconds:.0f}s idle for {workspace_root}",
+    )
+
+
+def log_limit_reached(
+    server_id: str,
+    workspace_root: str,
+    *,
+    total: int,
+    max_total: int,
+    per_id: int,
+    max_per_id: int,
+) -> None:
+    """A spawn was refused because every live client is busy and the
+    ``lsp.max_servers`` / ``lsp.max_servers_per_id`` cap is reached.
+    WARNING once per (server_id, workspace_root); DEBUG thereafter.
+    The edit still completes — the in-process syntax check runs instead."""
+    key = (server_id, workspace_root)
+    msg = (
+        f"spawn refused for {workspace_root}: {total}/{max_total or '∞'} servers, "
+        f"{per_id}/{max_per_id or '∞'} {server_id} — all busy "
+        "(raise lsp.max_servers or lower lsp.idle_timeout)"
+    )
+    if _announce_once(_announced_limit, key):
+        _emit(server_id, logging.WARNING, msg)
+    else:
+        _emit(server_id, logging.DEBUG, msg)
+
+
+def log_reaper_error(exc: BaseException) -> None:
+    """The reaper pass raised.  WARNING — the loop keeps running."""
+    _emit("reaper", logging.WARNING, f"reaper pass failed: {type(exc).__name__}: {exc}")
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:
@@ -195,6 +254,7 @@ def reset_announce_caches() -> None:
         _announced_unavailable.clear()
         _announced_no_root.clear()
         _announced_no_server.clear()
+        _announced_limit.clear()
 
 
 __all__ = [
@@ -209,5 +269,8 @@ __all__ = [
     "log_timeout",
     "log_server_error",
     "log_spawn_failed",
+    "log_reaped",
+    "log_limit_reached",
+    "log_reaper_error",
     "reset_announce_caches",
 ]

@@ -7901,6 +7901,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     cleanup_all_browsers()
                 except Exception as _e:
                     logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
+                try:
+                    # Language servers are children of this process and
+                    # are otherwise only reaped by atexit, which does not
+                    # run on every exit path (os._exit, SIGKILL after
+                    # TimeoutStopSec).  Idempotent.
+                    from agent.lsp import shutdown_service as _lsp_shutdown
+                    _lsp_shutdown()
+                except Exception as _e:
+                    logger.debug("lsp shutdown_service (%s) error: %s", phase, _e)
 
             logger.info(
                 "Stopping gateway%s...",

@@ -122,12 +122,35 @@ def _cmd_status(emit_json: bool) -> int:
         out.append(f"  wait_mode:       {info.get('wait_mode')}")
         out.append(f"  wait_timeout:    {info.get('wait_timeout')}s")
         out.append(f"  install_strategy:{info.get('install_strategy')}")
+        lc = info.get("lifecycle") or {}
+        if lc:
+            out.append(
+                f"  lifecycle:       idle_timeout={lc.get('idle_timeout')}s "
+                f"reap_interval={lc.get('reap_interval')}s "
+                f"max_servers={lc.get('max_servers') or 'unlimited'} "
+                f"per_id={lc.get('max_servers_per_id') or 'unlimited'} "
+                f"reaper={'alive' if lc.get('reaper_alive') else 'stopped'}"
+            )
+            out.append(
+                f"  reaped:          {lc.get('reaped_total', 0)} idle, "
+                f"{lc.get('evicted_total', 0)} evicted, "
+                f"{lc.get('forced_total', 0)} forced, "
+                f"{lc.get('graceful_failures', 0)} graceful failures, "
+                f"{lc.get('limit_refusals', 0)} spawns refused at cap"
+            )
         clients = info.get("clients") or []
         if clients:
             out.append(f"  active clients:  {len(clients)}")
             for c in clients:
+                mem = ""
+                if c.get("rss_kb") is not None:
+                    mem = f" rss={c['rss_kb'] // 1024}MB swap={(c.get('swap_kb') or 0) // 1024}MB"
+                idle = c.get("idle_seconds")
+                age = c.get("age_seconds")
                 out.append(
-                    f"    - {c['server_id']:20s} state={c['state']:10s} root={c['workspace_root']}"
+                    f"    - {c['server_id']:20s} state={c['state']:10s} pid={c.get('pid')} "
+                    f"age={_fmt_secs(age)} idle={_fmt_secs(idle)} "
+                    f"inflight={c.get('inflight', 0)}{mem} root={c['workspace_root']}"
                 )
         else:
             out.append("  active clients:  none")
@@ -171,6 +194,17 @@ def _cmd_status(emit_json: bool) -> int:
             out.append(f"      {s.description}")
     sys.stdout.write("\n".join(out) + "\n")
     return 0
+
+
+def _fmt_secs(s) -> str:
+    if s is None:
+        return "?"
+    s = float(s)
+    if s < 90:
+        return f"{s:.0f}s"
+    if s < 5400:
+        return f"{s / 60:.0f}m"
+    return f"{s / 3600:.1f}h"
 
 
 def _cmd_list(installed_only: bool) -> int:
