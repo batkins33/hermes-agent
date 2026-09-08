@@ -137,19 +137,22 @@ def _svc(**kw) -> LSPService:
 
 
 def _pid_alive(pid: int) -> bool:
+    """True iff ``pid`` is a live, non-zombie *mock server* process.
+
+    Deliberately never signals the pid: ``os.kill(pid, 0)`` on a pid that
+    has exited and been recycled by an unrelated process trips the
+    repository's live-system guard in ``tests/conftest.py`` (and would
+    be wrong anyway).  A recycled pid whose cmdline is no longer our mock
+    counts as dead.  Zombies count as dead: the client awaits
+    ``proc.wait()`` on teardown, so a reaped child is fully collected.
+    """
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    # Zombies still answer kill(0); the client awaits proc.wait() on
-    # teardown so a reaped child is fully collected.
-    try:
-        with open(f"/proc/{pid}/status") as fh:
-            for line in fh:
-                if line.startswith("State:"):
-                    return "Z" not in line.split()[1]
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if MOCK_SERVER.encode() not in cmd:
+            return False
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("State:"):
+                return "Z" not in line.split()[1]
     except OSError:
         return False
     return True
@@ -177,7 +180,7 @@ def _mock_pids_for_root(root: Path) -> set:
             cmd = (p / "cmdline").read_bytes()
         except OSError:
             continue
-        if MOCK_SERVER.encode() in cmd and _pid_alive(int(p.name)):
+        if _pid_alive(int(p.name)):
             out.add(int(p.name))
     return out
 
@@ -267,7 +270,11 @@ def test_recent_use_resets_idle_clock(mock_registry):
         assert c["pid"] == first_pid and c["idle_seconds"] < 1.0, f"touch did not refresh the idle clock: {c}"
         assert ("pyright", str(repo)) not in svc._broken, "touch tripped the broken-set path"
         time.sleep(2.0)                       # ~4.0s+ since spawn, ~2.0s since use
-        assert svc.reap_now() == 0, "reaped despite recent use"
+        before = {"t": time.time(), "last_used": dict(svc._last_used), "inflight": dict(svc._inflight),
+                  "clients": {k: (id(c), c.pid, c.is_running) for k, c in svc._clients.items()},
+                  "touched": touched, "status": svc.get_status()["clients"]}
+        n = svc.reap_now()
+        assert n == 0, f"reaped despite recent use: reap_now={n} state_before={before} lifecycle={svc.get_status()['lifecycle']}"
         assert _single_client(svc)["pid"] == first_pid
         assert _single_client(svc)["idle_seconds"] < 4.0
         _wait_until(lambda: time.time() - touched > 4.3, timeout=6.0)
@@ -762,7 +769,10 @@ def test_reaper_survives_failing_pass_and_never_orphans_the_victim(mock_registry
         assert lc["reaper_errors"] == 1
         assert lc["reaper_alive"] is True
         assert lc["reaped_total"] == 0
-        assert not svc._reaping and svc.get_status()["client_count"] == 0
+        # _reaping is released in _teardown's finally a few loop iterations
+        # after the pid dies (cleanup awaits the reader task); poll, don't snap.
+        assert _wait_until(lambda: not svc._reaping, timeout=5.0)
+        assert svc.get_status()["client_count"] == 0
     finally:
         svc.shutdown()
 
@@ -804,6 +814,7 @@ def test_cancelled_spawn_owner_releases_same_key_waiters(monkeypatch, tmp_path):
     svc = _svc(max_servers=1, shutdown_grace=2.0)
     try:
         svc.get_diagnostics_sync(str(r1 / "x.py"))    # idle stuck client fills the slot
+        victim_pid = _single_client(svc)["pid"]
 
         async def _scenario():
             async def _lease(path):
@@ -830,9 +841,42 @@ def test_cancelled_spawn_owner_releases_same_key_waiters(monkeypatch, tmp_path):
         # Not poisoned: the key is not in _broken and a later request spawns.
         assert ("pyright", str(r2)) not in svc._broken
         assert _wait_until(lambda: not svc._reaping, timeout=10.0)
+        # The eviction victim was mid-grace when the owner was cancelled; it
+        # must be SIGKILLed and accounted, never left as an untracked orphan.
+        assert _wait_until(lambda: not _pid_alive(victim_pid), timeout=5.0), "cancelled eviction orphaned the victim"
+        assert _mock_pids_for_root(r1) == set()
+        assert svc.get_status()["lifecycle"]["evicted_total"] == 1
         svc.get_diagnostics_sync(f2, delta=False)
         st = svc.get_status()
         assert st["client_count"] == 1 and st["clients"][0]["workspace_root"] == str(r2)
+    finally:
+        svc.shutdown()
+        restore()
+
+
+def test_caller_timeout_during_initialize_does_not_orphan_the_server(monkeypatch, tmp_path):
+    """Round-3 HIGH: the caller's sync timeout cancels the spawn owner
+    while client.start() is waiting on a slow ``initialize``.  The
+    half-started server must be killed, the future released, and the key
+    left in a consistent state (broken, not spawning)."""
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "slow")           # 1.0s before answering initialize
+    monkeypatch.chdir(str(tmp_path))
+    repo = _make_repo(tmp_path, "r1")
+    f = str(repo / "x.py")
+    svc = _svc()
+    try:
+        t0 = time.time()
+        assert svc.get_diagnostics_sync(f, timeout=0.3) == []
+        assert time.time() - t0 < 3.0
+        assert _wait_until(lambda: _mock_pids_for_root(repo) == set(), timeout=5.0), (
+            f"half-started server orphaned: {_mock_pids_for_root(repo)}"
+        )
+        # The owner's finally (resolve + pop) runs on the loop shortly after
+        # the sync caller was released by its timeout; poll, don't snap.
+        assert _wait_until(lambda: not svc._spawning, timeout=5.0), f"spawn future left registered: {svc._spawning}"
+        assert ("pyright", str(repo)) in svc._broken     # sync wrapper marks it; documented behaviour
+        assert svc.get_status()["client_count"] == 0
     finally:
         svc.shutdown()
         restore()

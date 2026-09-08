@@ -285,7 +285,11 @@ class LSPClient:
             await self._spawn()
             await self._initialize()
             self._state = "running"
-        except Exception:
+        except BaseException:
+            # BaseException on purpose: a caller-side timeout cancels this
+            # coroutine mid-initialize (CancelledError is not an Exception),
+            # and without cleanup the spawned server would outlive every
+            # reference to it (TAN-1039 review round 3).
             self._state = "error"
             await self._cleanup_process()
             raise

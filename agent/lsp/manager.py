@@ -650,7 +650,7 @@ class LSPService:
         # same-key request can only ever find and await this future —
         # never start a parallel spawn (TAN-1039 HIGH #1).
         loop = asyncio.get_running_loop()
-        spawn_future: asyncio.Future = loop.create_future()
+        spawn_future: Optional[asyncio.Future] = None
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
@@ -669,6 +669,9 @@ class LSPService:
                 self._inflight.pop(key, None)
             spawning = self._spawning.get(key)
             if spawning is None:
+                # create_future is synchronous, so registration stays
+                # atomic with the lookup above.
+                spawn_future = loop.create_future()
                 self._spawning[key] = spawn_future
         if spawning is not None:
             try:
@@ -692,8 +695,7 @@ class LSPService:
             # refuses (never kills a busy client) otherwise.  In-flight
             # spawns (other keys) count toward the caps.
             if not await self._make_room_for(key):
-                spawn_future.set_result(None)
-                return None
+                return None  # finally resolves the future with None
             ctx = ServerContext(
                 workspace_root=per_server_root,
                 install_strategy=self._install_strategy,
@@ -709,7 +711,6 @@ class LSPService:
                 # the structured logger so the user can act on it.
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
                 self._broken.add(key)
-                spawn_future.set_result(None)
                 return None
             client = LSPClient(
                 server_id=srv.server_id,
@@ -722,10 +723,16 @@ class LSPService:
             )
             try:
                 await client.start()
+            except asyncio.CancelledError:
+                # LSPClient.start() already cleaned up on cancellation;
+                # belt-and-braces so a half-started server can never
+                # outlive this coroutine (TAN-1039 review round 3).
+                with contextlib.suppress(Exception):
+                    await client.kill_now()
+                raise
             except Exception as e:  # noqa: BLE001
                 eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
                 self._broken.add(key)
-                spawn_future.set_result(None)
                 return None
             with self._state_lock:
                 self._clients[key] = client
@@ -855,6 +862,19 @@ class LSPService:
                 self._evicted_total += 1
             eventlog.log_reaped(key[0], key[1], idle, forced=forced, reason=reason)
             return True
+        except asyncio.CancelledError:
+            # The caller's timeout cancelled us mid-grace.  The client is
+            # already out of _clients, so nothing else will ever collect
+            # it: escalate to SIGKILL now, account for it, then propagate.
+            self._forced_total += 1
+            if reason == "idle":
+                self._reaped_total += 1
+            else:
+                self._evicted_total += 1
+            eventlog.log_reaped(key[0], key[1], idle, forced=True, reason=reason)
+            with contextlib.suppress(Exception):
+                await client.kill_now()
+            raise
         except Exception as e:  # noqa: BLE001
             self._reaper_errors += 1
             eventlog.log_reaper_error(e)
