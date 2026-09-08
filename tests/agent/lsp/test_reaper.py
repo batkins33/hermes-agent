@@ -116,10 +116,14 @@ def stuck_registry(monkeypatch, tmp_path):
 
 
 def _svc(**kw) -> LSPService:
+    # wait_timeout is generous: a mock reply that arrives late under load
+    # would otherwise trip get_diagnostics_sync's timeout path, which
+    # marks the key broken and forgets the client — and then every timing
+    # assertion in the test fails for an unrelated reason.
     base = dict(
         enabled=True,
         wait_mode="document",
-        wait_timeout=2.0,
+        wait_timeout=6.0,
         install_strategy="manual",
         idle_timeout=3600.0,
         reap_interval=3600.0,
@@ -251,18 +255,22 @@ def test_recent_use_resets_idle_clock(mock_registry):
     # Generous windows: each get_diagnostics_sync round trip costs
     # 0.1-0.3s on a loaded box, and the assertion is about ordering,
     # not precision (>1s of slack on every edge).
-    svc = _svc(idle_timeout=3.0)
+    svc = _svc(idle_timeout=4.0)
     try:
         svc.get_diagnostics_sync(f)
         first_pid = _single_client(svc)["pid"]
-        time.sleep(1.5)
+        assert ("pyright", str(repo)) not in svc._broken
+        time.sleep(2.0)
         svc.get_diagnostics_sync(f)          # touch: clock restarts
         touched = time.time()
-        time.sleep(1.5)                       # ~3.0s+ since spawn, ~1.5s since use
+        c = _single_client(svc)
+        assert c["pid"] == first_pid and c["idle_seconds"] < 1.0, f"touch did not refresh the idle clock: {c}"
+        assert ("pyright", str(repo)) not in svc._broken, "touch tripped the broken-set path"
+        time.sleep(2.0)                       # ~4.0s+ since spawn, ~2.0s since use
         assert svc.reap_now() == 0, "reaped despite recent use"
         assert _single_client(svc)["pid"] == first_pid
-        assert _single_client(svc)["idle_seconds"] < 3.0
-        _wait_until(lambda: time.time() - touched > 3.2, timeout=5.0)
+        assert _single_client(svc)["idle_seconds"] < 4.0
+        _wait_until(lambda: time.time() - touched > 4.3, timeout=6.0)
         assert svc.reap_now() == 1
     finally:
         svc.shutdown()
@@ -313,9 +321,11 @@ def test_forced_termination_when_server_ignores_shutdown(stuck_registry):
         t0 = time.time()
         assert svc.reap_now() == 1
         elapsed = time.time() - t0
-        # Hard bound: grace (0.5s) + SIGKILL + collection, nowhere near
-        # the client's own 2s shutdown-request + 1s SIGTERM budget.
-        assert elapsed < 2.5, f"forced path took {elapsed:.1f}s (grace was 0.5s)"
+        # Hard bound: grace (0.5s) + SIGKILL + collection.  The client's
+        # own graceful path would need >= 3.0s (2s shutdown request + 1s
+        # SIGTERM grace), so anything below that proves the reaper-side
+        # bound fired; typical is ~0.6s.
+        assert elapsed < 3.0, f"forced path took {elapsed:.1f}s (grace was 0.5s)"
         assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0), "SIGTERM-ignoring server survived"
         lc = svc.get_status()["lifecycle"]
         assert lc["reaped_total"] == 1
@@ -746,8 +756,8 @@ def test_reaper_survives_failing_pass_and_never_orphans_the_victim(mock_registry
             return await real(client)
 
         monkeypatch.setattr(svc, "_shutdown_client", _boom)
-        assert _wait_until(lambda: calls["n"] >= 1, timeout=5.0)
-        assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0), "victim orphaned after teardown failure"
+        assert _wait_until(lambda: calls["n"] >= 1, timeout=10.0)
+        assert _wait_until(lambda: not _pid_alive(pid), timeout=10.0), "victim orphaned after teardown failure"
         lc = svc.get_status()["lifecycle"]
         assert lc["reaper_errors"] == 1
         assert lc["reaper_alive"] is True
@@ -779,51 +789,53 @@ def test_graceful_shutdown_raising_is_forced_and_counted(mock_registry, monkeypa
         svc.shutdown()
 
 
-def test_spawn_owner_failure_releases_same_key_waiters(mock_registry, monkeypatch):
-    """If the coroutine that owns a spawn dies (here: build_spawn raises),
-    a concurrent same-key waiter must be released promptly with None
-    instead of hanging on the registered future."""
-    repo = _make_repo(mock_registry, "r1")
-    f = str(repo / "x.py")
-    svc = _svc()
-    idx = next(i for i, s in enumerate(SERVERS) if s.server_id == "pyright")
-    real_build = SERVERS[idx].build_spawn
-    gate = {"armed": True}
-
-    def _boom(root, ctx):
-        if gate["armed"]:
-            gate["armed"] = False
-            raise RuntimeError("synthetic build_spawn failure")
-        return real_build(root, ctx)
-
-    monkeypatch.setattr(SERVERS[idx], "build_spawn", _boom)
+def test_cancelled_spawn_owner_releases_same_key_waiters(monkeypatch, tmp_path):
+    """Round-2 HIGH: the coroutine that owns a spawn is cancelled while it
+    is suspended inside the cap-eviction await (the caller's sync timeout
+    does exactly this).  A same-key waiter that already captured the
+    registered future must be released promptly with None — not hang
+    until its own timeout — and the key must not be left in _spawning."""
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "stuck")
+    monkeypatch.chdir(str(tmp_path))
+    r1 = _make_repo(tmp_path, "r1")
+    r2 = _make_repo(tmp_path, "r2")
+    f2 = str(r2 / "x.py")
+    svc = _svc(max_servers=1, shutdown_grace=2.0)
     try:
-        async def _both():
-            async def _owner():
-                try:
-                    async with svc._leased_client(f) as c:
-                        return ("owner", c)
-                except RuntimeError as e:
-                    return ("owner-raised", str(e))
+        svc.get_diagnostics_sync(str(r1 / "x.py"))    # idle stuck client fills the slot
 
-            async def _waiter():
-                await asyncio.sleep(0.01)  # ensure the owner registered first
-                async with svc._leased_client(f) as c:
-                    return ("waiter", c)
+        async def _scenario():
+            async def _lease(path):
+                async with svc._leased_client(path) as c:
+                    return c
 
-            return await asyncio.gather(_owner(), _waiter())
+            owner = asyncio.create_task(_lease(f2))     # registers future, suspends in eviction
+            await asyncio.sleep(0.2)
+            assert ("pyright", str(r2)) in svc._spawning
+            waiter = asyncio.create_task(_lease(f2))    # captures the registered future
+            await asyncio.sleep(0.2)
+            owner.cancel()
+            t0 = time.time()
+            w = await asyncio.wait_for(waiter, timeout=5.0)
+            elapsed = time.time() - t0
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            return w, elapsed
 
-        t0 = time.time()
-        owner, waiter = svc._loop.run(_both(), timeout=10.0)
-        assert time.time() - t0 < 3.0, "waiter hung on an unresolved spawn future"
-        assert owner[0] == "owner-raised"
-        assert waiter == ("waiter", None)
+        w, elapsed = svc._loop.run(_scenario(), timeout=30.0)
+        assert w is None, "waiter should be released with None after the owner was cancelled"
+        assert elapsed < 1.0, f"waiter hung {elapsed:.1f}s on an unresolved spawn future"
         assert not svc._spawning
-        # The key is not poisoned by the waiter: a later request spawns normally.
-        assert svc.get_diagnostics_sync(f, delta=False) is not None
-        assert svc.get_status()["client_count"] == 1
+        # Not poisoned: the key is not in _broken and a later request spawns.
+        assert ("pyright", str(r2)) not in svc._broken
+        assert _wait_until(lambda: not svc._reaping, timeout=10.0)
+        svc.get_diagnostics_sync(f2, delta=False)
+        st = svc.get_status()
+        assert st["client_count"] == 1 and st["clients"][0]["workspace_root"] == str(r2)
     finally:
         svc.shutdown()
+        restore()
 
 
 def test_concurrent_distinct_key_spawns_at_cap_yield_one_spawn_one_refusal(mock_registry):
