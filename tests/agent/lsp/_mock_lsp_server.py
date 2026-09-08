@@ -17,6 +17,9 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   (simulates a crashing server).
 - ``"slow"`` — same as ``clean`` but sleeps 1s before responding to
   ``initialize`` (lets us test timeout behaviour).
+- ``"stuck"`` — same as ``clean`` but never answers ``shutdown``,
+  ignores ``exit`` and ignores SIGTERM, so only SIGKILL ends it
+  (exercises the reaper's forced-termination path).
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -56,6 +59,12 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    if script == "stuck":
+        import signal
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except (AttributeError, ValueError, OSError):
+            pass
 
     while True:
         msg = read_message()
@@ -138,10 +147,14 @@ def main():
             continue
 
         if msg.get("method") == "shutdown":
+            if script == "stuck":
+                continue  # never acknowledge
             write_message({"jsonrpc": "2.0", "id": msg["id"], "result": None})
             continue
 
         if msg.get("method") == "exit":
+            if script == "stuck":
+                continue  # refuse to exit
             return 0
 
         # Unknown request: respond with method-not-found.

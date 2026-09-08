@@ -209,9 +209,30 @@ budget is `wait_timeout` seconds — typically the server responds in
 tens of milliseconds for pyright/tsserver and a few seconds for
 rust-analyzer mid-indexing.
 
-Servers are kept alive for the life of the Hermes process. There's
-no idle-timeout reaper — the cost of restarting the server's index
-on every write would be far higher than holding the daemon.
+Servers stay alive while they are being used and for
+`lsp.idle_timeout` seconds after their last request (default 30
+minutes), then a reaper on the LSP loop shuts them down — graceful
+`shutdown`/`exit` first, SIGKILL after `lsp.shutdown_grace` seconds
+if the server ignores it. A server that is mid-request is never
+reaped. Live servers are also capped by `lsp.max_servers` (default 8)
+and `lsp.max_servers_per_id` (default 3 per language server); at the
+cap the least-recently-used idle server is shut down to make room,
+and if every server is busy the new spawn is refused and the edit
+falls back to the in-process syntax check instead of killing a busy
+server.
+
+The re-index cost on the next edit after a reap is real (1-3 s for
+most servers), which is why the default idle window is 30 minutes
+rather than 30 seconds. Set `lsp.idle_timeout: 0` to disable reaping
+entirely; note that in a long-lived gateway this means a pyright that
+indexed a large tree once will hold that memory (and swap) until the
+gateway restarts — exactly the leak that motivated the reaper.
+
+`hermes lsp status` shows each live server's pid, age, idle age,
+in-flight requests and RSS/swap, plus the reaper's counters
+(reaped, evicted, forced kills, graceful failures, spawns refused at
+the cap). Reaps are logged as `lsp[<server>] reaped (...)` in
+`agent.log`.
 
 ## Disabling
 
