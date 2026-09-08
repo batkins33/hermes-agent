@@ -213,10 +213,12 @@ Servers stay alive while they are being used and for
 `lsp.idle_timeout` seconds after their last request (default 30
 minutes), then a reaper on the LSP loop shuts them down — graceful
 `shutdown`/`exit` first, SIGKILL after `lsp.shutdown_grace` seconds
-if the server ignores it. A server that is mid-request is never
-reaped. Live servers are also capped by `lsp.max_servers` (default 8)
-and `lsp.max_servers_per_id` (default 3 per language server); at the
-cap the least-recently-used idle server is shut down to make room,
+if the server ignores it (`0` means SIGKILL immediately). A server that
+is mid-request is never reaped, and a reaper pass tears its victims down
+concurrently, so a pass is bounded by one grace period. Live servers are also capped by `lsp.max_servers` (default 8)
+and `lsp.max_servers_per_id` (default 3 per language server); spawns
+already in flight count toward the caps. At the cap the
+least-recently-used idle server is shut down to make room,
 and if every server is busy the new spawn is refused and the edit
 falls back to the in-process syntax check instead of killing a busy
 server.

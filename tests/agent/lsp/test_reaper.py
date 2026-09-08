@@ -44,6 +44,13 @@ from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
+# The reaper samples /proc, the tests scan /proc for orphans, and the mock
+# ignores SIGTERM via signal(): Linux-only, matching the gateway host.
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not Path("/proc").is_dir(),
+    reason="Linux /proc lifecycle tests",
+)
+
 
 # ---------------------------------------------------------------------------
 # helpers / fixtures
@@ -109,10 +116,14 @@ def stuck_registry(monkeypatch, tmp_path):
 
 
 def _svc(**kw) -> LSPService:
+    # wait_timeout is generous: a mock reply that arrives late under load
+    # would otherwise trip get_diagnostics_sync's timeout path, which
+    # marks the key broken and forgets the client — and then every timing
+    # assertion in the test fails for an unrelated reason.
     base = dict(
         enabled=True,
         wait_mode="document",
-        wait_timeout=2.0,
+        wait_timeout=6.0,
         install_strategy="manual",
         idle_timeout=3600.0,
         reap_interval=3600.0,
@@ -126,19 +137,22 @@ def _svc(**kw) -> LSPService:
 
 
 def _pid_alive(pid: int) -> bool:
+    """True iff ``pid`` is a live, non-zombie *mock server* process.
+
+    Deliberately never signals the pid: ``os.kill(pid, 0)`` on a pid that
+    has exited and been recycled by an unrelated process trips the
+    repository's live-system guard in ``tests/conftest.py`` (and would
+    be wrong anyway).  A recycled pid whose cmdline is no longer our mock
+    counts as dead.  Zombies count as dead: the client awaits
+    ``proc.wait()`` on teardown, so a reaped child is fully collected.
+    """
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    # Zombies still answer kill(0); the client awaits proc.wait() on
-    # teardown so a reaped child is fully collected.
-    try:
-        with open(f"/proc/{pid}/status") as fh:
-            for line in fh:
-                if line.startswith("State:"):
-                    return "Z" not in line.split()[1]
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if MOCK_SERVER.encode() not in cmd:
+            return False
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("State:"):
+                return "Z" not in line.split()[1]
     except OSError:
         return False
     return True
@@ -151,6 +165,24 @@ def _wait_until(pred, timeout: float, step: float = 0.05) -> bool:
             return True
         time.sleep(step)
     return pred()
+
+
+def _mock_pids_for_root(root: Path) -> set:
+    """Every live mock-server pid whose cwd is ``root`` — including any
+    orphan the service no longer tracks.  /proc scan, no psutil."""
+    out = set()
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            if os.readlink(p / "cwd") != str(root):
+                continue
+            cmd = (p / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if _pid_alive(int(p.name)):
+            out.add(int(p.name))
+    return out
 
 
 def _single_client(svc: LSPService):
@@ -225,19 +257,27 @@ def test_recent_use_resets_idle_clock(mock_registry):
     f = str(repo / "x.py")
     # Generous windows: each get_diagnostics_sync round trip costs
     # 0.1-0.3s on a loaded box, and the assertion is about ordering,
-    # not precision.
-    svc = _svc(idle_timeout=1.5)
+    # not precision (>1s of slack on every edge).
+    svc = _svc(idle_timeout=4.0)
     try:
         svc.get_diagnostics_sync(f)
         first_pid = _single_client(svc)["pid"]
-        time.sleep(0.9)
+        assert ("pyright", str(repo)) not in svc._broken
+        time.sleep(2.0)
         svc.get_diagnostics_sync(f)          # touch: clock restarts
         touched = time.time()
-        time.sleep(0.9)                       # ~1.8s since spawn, ~0.9s since use
-        assert svc.reap_now() == 0, "reaped despite recent use"
+        c = _single_client(svc)
+        assert c["pid"] == first_pid and c["idle_seconds"] < 1.0, f"touch did not refresh the idle clock: {c}"
+        assert ("pyright", str(repo)) not in svc._broken, "touch tripped the broken-set path"
+        time.sleep(2.0)                       # ~4.0s+ since spawn, ~2.0s since use
+        before = {"t": time.time(), "last_used": dict(svc._last_used), "inflight": dict(svc._inflight),
+                  "clients": {k: (id(c), c.pid, c.is_running) for k, c in svc._clients.items()},
+                  "touched": touched, "status": svc.get_status()["clients"]}
+        n = svc.reap_now()
+        assert n == 0, f"reaped despite recent use: reap_now={n} state_before={before} lifecycle={svc.get_status()['lifecycle']}"
         assert _single_client(svc)["pid"] == first_pid
-        assert _single_client(svc)["idle_seconds"] < 1.5
-        _wait_until(lambda: time.time() - touched > 1.6, timeout=3.0)
+        assert _single_client(svc)["idle_seconds"] < 4.0
+        _wait_until(lambda: time.time() - touched > 4.3, timeout=6.0)
         assert svc.reap_now() == 1
     finally:
         svc.shutdown()
@@ -288,9 +328,11 @@ def test_forced_termination_when_server_ignores_shutdown(stuck_registry):
         t0 = time.time()
         assert svc.reap_now() == 1
         elapsed = time.time() - t0
-        # Hard bound: grace (0.5s) + SIGKILL + collection, nowhere near
-        # the client's own 2s shutdown-request + 1s SIGTERM budget.
-        assert elapsed < 2.5, f"forced path took {elapsed:.1f}s (grace was 0.5s)"
+        # Hard bound: grace (0.5s) + SIGKILL + collection.  The client's
+        # own graceful path would need >= 3.0s (2s shutdown request + 1s
+        # SIGTERM grace), so anything below that proves the reaper-side
+        # bound fired; typical is ~0.6s.
+        assert elapsed < 3.0, f"forced path took {elapsed:.1f}s (grace was 0.5s)"
         assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0), "SIGTERM-ignoring server survived"
         lc = svc.get_status()["lifecycle"]
         assert lc["reaped_total"] == 1
@@ -542,6 +584,340 @@ def test_regression_idle_pyright_does_not_survive_with_automatic_reaper(mock_reg
         )
         assert _wait_until(lambda: not _pid_alive(c["pid"]), timeout=5.0)
         assert svc.get_status()["lifecycle"]["reaped_total"] == 1
+    finally:
+        svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# TAN-1039 regressions: the two HIGH findings from the retroactive review
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_same_key_spawn_at_cap_spawns_exactly_once(monkeypatch, tmp_path):
+    """HIGH #1: at max_servers, two simultaneous requests for the same new
+    key must resolve to one client.  The eviction victim is a 'stuck'
+    server so `_make_room_for` genuinely suspends for the grace period.
+    Pre-fix, the second request found neither a client nor a registered
+    spawn future during that suspension and started its own spawn (the
+    exact ordering of the two spawns then varied, but two servers were
+    created and one was orphaned or evicted).  Fixed code registers the
+    future before the suspension, so the second request awaits it.
+    Asserts one client object, one registered pid, one eviction, and zero
+    orphan mock processes for that root."""
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "stuck")
+    monkeypatch.chdir(str(tmp_path))
+    r1 = _make_repo(tmp_path, "r1")
+    r2 = _make_repo(tmp_path, "r2")
+    f2 = str(r2 / "x.py")
+    svc = _svc(max_servers=1, shutdown_grace=1.0)
+    try:
+        svc.get_diagnostics_sync(str(r1 / "x.py"))    # occupies the single slot
+        assert svc.get_status()["client_count"] == 1
+
+        async def _two():
+            async def _one():
+                async with svc._leased_client(f2) as c:
+                    return c
+            return await asyncio.gather(_one(), _one())
+
+        c_a, c_b = svc._loop.run(_two(), timeout=30.0)
+        assert c_a is not None and c_b is not None
+        assert c_a is c_b, "two clients spawned for one key"
+        st = svc.get_status()
+        assert st["client_count"] == 1
+        assert st["clients"][0]["workspace_root"] == str(r2)
+        assert st["lifecycle"]["evicted_total"] == 1, "victim evicted more than once"
+        assert _wait_until(lambda: len(_mock_pids_for_root(r2)) == 1, timeout=5.0), (
+            f"orphan mock processes for r2: {_mock_pids_for_root(r2)}"
+        )
+        assert not svc._spawning and not svc._reaping
+    finally:
+        svc.shutdown()
+        restore()
+
+
+def test_stale_lease_on_crashed_client_does_not_uncount_replacement(monkeypatch, tmp_path):
+    """HIGH #2: caller A holds a lease on client 1; the server dies; caller
+    B spawns a replacement (lease count 1).  When A's lease is released it
+    must not decrement the replacement's count, and the replacement must
+    stay ineligible for reaping/eviction while B is in flight."""
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "clean")
+    monkeypatch.chdir(str(tmp_path))
+    repo = _make_repo(tmp_path, "r1")
+    f = str(repo / "x.py")
+    key = ("pyright", str(repo))
+    svc = _svc(idle_timeout=0.001)
+    try:
+        svc.get_diagnostics_sync(f)
+        client1 = svc._clients[key]
+        pid1 = client1.pid
+
+        async def _scenario():
+            # A takes a lease on client1 and keeps it.
+            lease_a = svc._leased_client(f)
+            got_a = await lease_a.__aenter__()
+            assert got_a is client1
+            assert svc._inflight[key] == 1
+            # Server crashes under A.
+            os.kill(pid1, 9)
+            deadline = time.time() + 5
+            while client1.is_running and time.time() < deadline:
+                await asyncio.sleep(0.05)
+            assert not client1.is_running
+            # B arrives: dead-client branch spawns a replacement with its own lease.
+            lease_b = svc._leased_client(f)
+            client2 = await lease_b.__aenter__()
+            assert client2 is not None and client2 is not client1
+            assert svc._clients[key] is client2
+            assert svc._inflight[key] == 1, "replacement lease not counted"
+            # A releases its stale lease: replacement must remain counted.
+            await lease_a.__aexit__(None, None, None)
+            assert svc._inflight.get(key) == 1, "stale lease decremented the replacement"
+            with svc._state_lock:
+                assert svc._select_idle(time.time() + 10, min_idle=0.0) == [], (
+                    "busy replacement selectable as a victim"
+                )
+            assert await svc._reap_idle() == 0
+            assert svc._clients[key] is client2 and client2.is_running
+            await lease_b.__aexit__(None, None, None)
+            assert key not in svc._inflight
+            return client2.pid
+
+        pid2 = svc._loop.run(_scenario(), timeout=30.0)
+        assert pid2 != pid1 and _pid_alive(pid2)
+    finally:
+        svc.shutdown()
+        restore()
+
+
+def test_real_lease_blocks_reap_during_request(monkeypatch, tmp_path):
+    """A request that is genuinely in flight (slow diagnostics, no private
+    state injected) survives a reap pass with idle_timeout ~0."""
+    import threading
+
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "clean")
+    monkeypatch.chdir(str(tmp_path))
+    repo = _make_repo(tmp_path, "r1")
+    slow = repo / "slow_file.py"
+    slow.write_text("x = 1\n")
+    svc = _svc(idle_timeout=0.001, wait_timeout=4.0)
+    result = {}
+
+    def _caller():
+        result["diags"] = svc.get_diagnostics_sync(str(slow), delta=False)
+
+    try:
+        t = threading.Thread(target=_caller, daemon=True)
+        t.start()
+        assert _wait_until(lambda: svc.get_status()["client_count"] == 1, timeout=5.0)
+        pid = _single_client(svc)["pid"]
+        time.sleep(0.3)                                   # inside the 1.0s slow window
+        assert _single_client(svc)["inflight"] == 1
+        assert svc.reap_now() == 0, "reaped a client with a real in-flight request"
+        assert _pid_alive(pid)
+        t.join(timeout=10)
+        assert not t.is_alive() and "diags" in result
+        assert _single_client(svc)["pid"] == pid
+        time.sleep(0.05)
+        assert svc.reap_now() == 1                        # idle now: reaped
+    finally:
+        svc.shutdown()
+        restore()
+
+
+def test_shutdown_grace_zero_escalates_immediately(stuck_registry):
+    repo = _make_repo(stuck_registry, "r1")
+    svc = _svc(idle_timeout=0.05, shutdown_grace=0)
+    try:
+        svc.get_diagnostics_sync(str(repo / "x.py"))
+        pid = _single_client(svc)["pid"]
+        time.sleep(0.1)
+        t0 = time.time()
+        assert svc.reap_now() == 1
+        assert time.time() - t0 < 2.0, "grace=0 did not escalate immediately"
+        assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0)
+        assert svc.get_status()["lifecycle"]["forced_total"] == 1
+    finally:
+        svc.shutdown()
+
+
+def test_reaper_survives_failing_pass_and_never_orphans_the_victim(mock_registry, monkeypatch):
+    """A teardown failure must be counted, logged, answered with SIGKILL
+    (the claimed client is already out of ``_clients``, so nothing else
+    would ever collect it), and must not kill the reaper task."""
+    repo = _make_repo(mock_registry, "r1")
+    svc = _svc(idle_timeout=0.05, reap_interval=1.0, start_reaper=True)
+    try:
+        svc.get_diagnostics_sync(str(repo / "x.py"))
+        pid = _single_client(svc)["pid"]
+        calls = {"n": 0}
+        real = svc._shutdown_client
+
+        async def _boom(client):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("synthetic teardown failure")
+            return await real(client)
+
+        monkeypatch.setattr(svc, "_shutdown_client", _boom)
+        assert _wait_until(lambda: calls["n"] >= 1, timeout=10.0)
+        assert _wait_until(lambda: not _pid_alive(pid), timeout=10.0), "victim orphaned after teardown failure"
+        lc = svc.get_status()["lifecycle"]
+        assert lc["reaper_errors"] == 1
+        assert lc["reaper_alive"] is True
+        assert lc["reaped_total"] == 0
+        # _reaping is released in _teardown's finally a few loop iterations
+        # after the pid dies (cleanup awaits the reader task); poll, don't snap.
+        assert _wait_until(lambda: not svc._reaping, timeout=5.0)
+        assert svc.get_status()["client_count"] == 0
+    finally:
+        svc.shutdown()
+
+
+def test_graceful_shutdown_raising_is_forced_and_counted(mock_registry, monkeypatch):
+    repo = _make_repo(mock_registry, "r1")
+    svc = _svc(idle_timeout=0.05)
+    try:
+        svc.get_diagnostics_sync(str(repo / "x.py"))
+        key = ("pyright", str(repo))
+        client = svc._clients[key]
+        pid = client.pid
+
+        async def _raise():
+            raise RuntimeError("shutdown request exploded")
+
+        monkeypatch.setattr(client, "shutdown", _raise)
+        time.sleep(0.1)
+        assert svc.reap_now() == 1
+        lc = svc.get_status()["lifecycle"]
+        assert lc["graceful_failures"] == 1 and lc["forced_total"] == 1 and lc["reaper_errors"] == 0
+        assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0)
+    finally:
+        svc.shutdown()
+
+
+def test_cancelled_spawn_owner_releases_same_key_waiters(monkeypatch, tmp_path):
+    """Round-2 HIGH: the coroutine that owns a spawn is cancelled while it
+    is suspended inside the cap-eviction await (the caller's sync timeout
+    does exactly this).  A same-key waiter that already captured the
+    registered future must be released promptly with None — not hang
+    until its own timeout — and the key must not be left in _spawning."""
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "stuck")
+    monkeypatch.chdir(str(tmp_path))
+    r1 = _make_repo(tmp_path, "r1")
+    r2 = _make_repo(tmp_path, "r2")
+    f2 = str(r2 / "x.py")
+    svc = _svc(max_servers=1, shutdown_grace=2.0)
+    try:
+        svc.get_diagnostics_sync(str(r1 / "x.py"))    # idle stuck client fills the slot
+        victim_pid = _single_client(svc)["pid"]
+
+        async def _scenario():
+            async def _lease(path):
+                async with svc._leased_client(path) as c:
+                    return c
+
+            owner = asyncio.create_task(_lease(f2))     # registers future, suspends in eviction
+            await asyncio.sleep(0.2)
+            assert ("pyright", str(r2)) in svc._spawning
+            waiter = asyncio.create_task(_lease(f2))    # captures the registered future
+            await asyncio.sleep(0.2)
+            owner.cancel()
+            t0 = time.time()
+            w = await asyncio.wait_for(waiter, timeout=5.0)
+            elapsed = time.time() - t0
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            return w, elapsed
+
+        w, elapsed = svc._loop.run(_scenario(), timeout=30.0)
+        assert w is None, "waiter should be released with None after the owner was cancelled"
+        assert elapsed < 1.0, f"waiter hung {elapsed:.1f}s on an unresolved spawn future"
+        assert not svc._spawning
+        # Not poisoned: the key is not in _broken and a later request spawns.
+        assert ("pyright", str(r2)) not in svc._broken
+        assert _wait_until(lambda: not svc._reaping, timeout=10.0)
+        # The eviction victim was mid-grace when the owner was cancelled; it
+        # must be SIGKILLed and accounted, never left as an untracked orphan.
+        assert _wait_until(lambda: not _pid_alive(victim_pid), timeout=5.0), "cancelled eviction orphaned the victim"
+        assert _mock_pids_for_root(r1) == set()
+        assert svc.get_status()["lifecycle"]["evicted_total"] == 1
+        svc.get_diagnostics_sync(f2, delta=False)
+        st = svc.get_status()
+        assert st["client_count"] == 1 and st["clients"][0]["workspace_root"] == str(r2)
+    finally:
+        svc.shutdown()
+        restore()
+
+
+def test_caller_timeout_during_initialize_does_not_orphan_the_server(monkeypatch, tmp_path):
+    """Round-3 HIGH: the caller's sync timeout cancels the spawn owner
+    while client.start() is waiting on a slow ``initialize``.  The
+    half-started server must be killed, the future released, and the key
+    left in a consistent state (broken, not spawning)."""
+    eventlog.reset_announce_caches()
+    restore = _swap_server("pyright", "slow")           # 1.0s before answering initialize
+    monkeypatch.chdir(str(tmp_path))
+    repo = _make_repo(tmp_path, "r1")
+    f = str(repo / "x.py")
+    svc = _svc()
+    try:
+        t0 = time.time()
+        assert svc.get_diagnostics_sync(f, timeout=0.3) == []
+        assert time.time() - t0 < 3.0
+        assert _wait_until(lambda: _mock_pids_for_root(repo) == set(), timeout=5.0), (
+            f"half-started server orphaned: {_mock_pids_for_root(repo)}"
+        )
+        # The owner's finally (resolve + pop) runs on the loop shortly after
+        # the sync caller was released by its timeout; poll, don't snap.
+        assert _wait_until(lambda: not svc._spawning, timeout=5.0), f"spawn future left registered: {svc._spawning}"
+        assert ("pyright", str(repo)) in svc._broken     # sync wrapper marks it; documented behaviour
+        assert svc.get_status()["client_count"] == 0
+    finally:
+        svc.shutdown()
+        restore()
+
+
+def test_concurrent_distinct_key_spawns_at_cap_yield_one_spawn_one_refusal(mock_registry):
+    r1 = _make_repo(mock_registry, "r1")
+    r2 = _make_repo(mock_registry, "r2")
+    svc = _svc(max_servers=1)
+    try:
+        async def _both():
+            async def _one(path):
+                async with svc._leased_client(path) as c:
+                    return c
+            return await asyncio.gather(_one(str(r1 / "x.py")), _one(str(r2 / "x.py")))
+
+        a, b = svc._loop.run(_both(), timeout=30.0)
+        assert (a is None) != (b is None), "expected exactly one spawn and one refusal"
+        st = svc.get_status()
+        assert st["client_count"] == 1
+        assert st["lifecycle"]["limit_refusals"] == 1
+        assert st["lifecycle"]["evicted_total"] == 0
+    finally:
+        svc.shutdown()
+
+
+def test_per_id_cap_evicts_only_same_server(mock_registry):
+    r1 = _make_repo(mock_registry, "r1")
+    r2 = _make_repo(mock_registry, "r2", ext=".ts")
+    r3 = _make_repo(mock_registry, "r3")
+    svc = _svc(max_servers=0, max_servers_per_id=1)
+    try:
+        svc.get_diagnostics_sync(str(r1 / "x.py"))
+        svc.get_diagnostics_sync(str(r2 / "x.ts"))
+        ts_pid = next(c["pid"] for c in svc.get_status()["clients"] if c["server_id"] == "typescript")
+        svc.get_diagnostics_sync(str(r3 / "x.py"))       # per-id cap on pyright: evict r1, not typescript
+        st = svc.get_status()
+        roots = {c["server_id"]: c["workspace_root"] for c in st["clients"]}
+        assert roots == {"pyright": str(r3), "typescript": str(r2)}
+        assert st["lifecycle"]["evicted_total"] == 1
+        assert _pid_alive(ts_pid)
     finally:
         svc.shutdown()
 

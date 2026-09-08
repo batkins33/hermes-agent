@@ -20,6 +20,9 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
 - ``"stuck"`` — same as ``clean`` but never answers ``shutdown``,
   ignores ``exit`` and ignores SIGTERM, so only SIGKILL ends it
   (exercises the reaper's forced-termination path).
+Independent of the script, a document whose *file name* starts with
+``slow`` gets its diagnostics published only after a 1.0s delay, so a
+request can be held in flight deterministically.
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -105,6 +108,8 @@ def main():
             td = params.get("textDocument") or {}
             uri = td.get("uri", "")
             version = td.get("version", 0)
+            if uri.rsplit("/", 1)[-1].startswith("slow"):
+                time.sleep(1.0)
             diagnostics = []
             if script == "errors":
                 diagnostics = [

@@ -45,6 +45,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
@@ -284,7 +285,11 @@ class LSPClient:
             await self._spawn()
             await self._initialize()
             self._state = "running"
-        except Exception:
+        except BaseException:
+            # BaseException on purpose: a caller-side timeout cancels this
+            # coroutine mid-initialize (CancelledError is not an Exception),
+            # and without cleanup the spawned server would outlive every
+            # reference to it (TAN-1039 review round 3).
             self._state = "error"
             await self._cleanup_process()
             raise
@@ -324,8 +329,7 @@ class LSPClient:
                 cwd=self._cwd,
                 start_new_session=True,
             )
-            import time as _time
-            self.created_at = _time.time()
+            self.created_at = time.time()
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
