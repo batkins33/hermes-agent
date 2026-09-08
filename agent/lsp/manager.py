@@ -535,9 +535,15 @@ class LSPService:
         Exposed for ``hermes lsp status``-style tooling and tests; the
         background reaper calls the same coroutine.
         """
-        if not self._enabled:
+        if not self._enabled or self._loop.loop is None:
             return 0
-        return int(self._loop.run(self._reap_idle(), timeout=self._shutdown_grace + 10.0) or 0)
+        try:
+            return int(self._loop.run(self._reap_idle(), timeout=self._shutdown_grace + 15.0) or 0)
+        except Exception as e:  # noqa: BLE001
+            # Tooling entry point: never raise out of a reap request.
+            self._reaper_errors += 1
+            logger.warning("LSP reap_now failed: %s", e)
+            return 0
 
     # ------------------------------------------------------------------
     # async internals — leases
@@ -562,12 +568,18 @@ class LSPService:
             yield client
         finally:
             with self._state_lock:
-                n = self._inflight.get(key, 1) - 1
-                if n > 0:
-                    self._inflight[key] = n
-                else:
-                    self._inflight.pop(key, None)
-                self._last_used[key] = time.time()
+                # Bind the release to the client object, not just the key:
+                # if this client died mid-request and a replacement was
+                # spawned under the same key, the replacement's lease count
+                # belongs to *its* callers and must not be decremented here
+                # (TAN-1039 HIGH #2).
+                if self._clients.get(key) is client:
+                    n = self._inflight.get(key, 1) - 1
+                    if n > 0:
+                        self._inflight[key] = n
+                    else:
+                        self._inflight.pop(key, None)
+                    self._last_used[key] = time.time()
 
     async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
         async with self._leased_client(file_path) as client:
@@ -630,6 +642,13 @@ class LSPService:
         key = (srv.server_id, per_server_root)
         if key in self._broken:
             return None
+        # Lookup, dead-client replacement, and spawn registration happen
+        # in ONE critical section.  The spawn future is registered here,
+        # before any await (including the cap check below), so a second
+        # same-key request can only ever find and await this future —
+        # never start a parallel spawn (TAN-1039 HIGH #1).
+        loop = asyncio.get_running_loop()
+        spawn_future: asyncio.Future = loop.create_future()
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
@@ -641,10 +660,14 @@ class LSPService:
                 return client
             if client is not None:
                 # Dead client (server crashed).  Drop it so the spawn
-                # below replaces it instead of returning a corpse.
+                # below replaces it instead of returning a corpse.  Any
+                # lease still held on the corpse releases against the
+                # object, not the key (see _leased_client).
                 self._clients.pop(key, None)
                 self._inflight.pop(key, None)
             spawning = self._spawning.get(key)
+            if spawning is None:
+                self._spawning[key] = spawn_future
         if spawning is not None:
             try:
                 spawned = await spawning
@@ -659,18 +682,16 @@ class LSPService:
                 self._last_used[key] = time.time()
             return spawned
 
-        # Enforce concurrency caps BEFORE paying for a spawn.  Evicts
-        # the least-recently-used idle client if that frees a slot;
-        # refuses (never kills a busy client) otherwise.
-        if not await self._make_room_for(key):
-            return None
-
-        # Begin spawn
-        loop = asyncio.get_running_loop()
-        spawn_future: asyncio.Future = loop.create_future()
-        with self._state_lock:
-            self._spawning[key] = spawn_future
+        # We own the spawn for this key.  Everything below runs under the
+        # registered future; the finally pops it.
         try:
+            # Enforce concurrency caps BEFORE paying for a spawn.  Evicts
+            # the least-recently-used idle client if that frees a slot;
+            # refuses (never kills a busy client) otherwise.  In-flight
+            # spawns (other keys) count toward the caps.
+            if not await self._make_room_for(key):
+                spawn_future.set_result(None)
+                return None
             ctx = ServerContext(
                 workspace_root=per_server_root,
                 install_strategy=self._install_strategy,
@@ -815,17 +836,23 @@ class LSPService:
         self._last_reap_at = now
         if not claimed:
             return 0
-        reaped = 0
-        for key, client, idle in claimed:
+
+        async def _one(key: _Key, client: LSPClient, idle: float) -> bool:
             try:
                 forced = await self._shutdown_client(client)
-                reaped += 1
                 self._reaped_total += 1
                 eventlog.log_reaped(key[0], key[1], idle, forced=forced, reason="idle")
+                return True
             finally:
                 with self._state_lock:
                     self._reaping.discard(key)
-        return reaped
+
+        # Victims are torn down concurrently so a pass is bounded by one
+        # grace period, not N of them (TAN-1039 WARN).
+        results = await asyncio.gather(
+            *(_one(k, c, i) for k, c, i in claimed), return_exceptions=True
+        )
+        return sum(1 for r in results if r is True)
 
     async def _shutdown_client(self, client: LSPClient) -> bool:
         """Graceful shutdown with a bounded wait, then SIGKILL.
@@ -842,7 +869,12 @@ class LSPService:
         # graceful task then unblocks on its own (the pipes close and
         # ``proc.wait()`` returns) and is collected below.
         task = asyncio.ensure_future(client.shutdown())
-        done, _pending = await asyncio.wait({task}, timeout=self._shutdown_grace or None)
+        # shutdown_grace == 0 means "escalate to SIGKILL immediately";
+        # it is never an unbounded wait (TAN-1039 WARN).
+        if self._shutdown_grace > 0:
+            done, _pending = await asyncio.wait({task}, timeout=self._shutdown_grace)
+        else:
+            done = set()
         if task not in done:
             self._graceful_failures += 1
             forced = True
@@ -852,7 +884,7 @@ class LSPService:
                 await asyncio.wait_for(task, timeout=5.0)
             except Exception:  # noqa: BLE001
                 task.cancel()
-                with contextlib.suppress(BaseException):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         else:
             exc = task.exception()
@@ -878,8 +910,13 @@ class LSPService:
         """
         while True:
             with self._state_lock:
-                total = len(self._clients)
-                per_id = sum(1 for k in self._clients if k[0] == key[0])
+                # Live clients plus spawns already in flight for OTHER keys
+                # (ours is registered too; don't count ourselves).
+                pending = [k for k in self._spawning if k != key]
+                total = len(self._clients) + len(pending)
+                per_id = sum(1 for k in self._clients if k[0] == key[0]) + sum(
+                    1 for k in pending if k[0] == key[0]
+                )
                 over_total = self._max_servers and total >= self._max_servers
                 over_id = self._max_servers_per_id and per_id >= self._max_servers_per_id
                 if not (over_total or over_id):
@@ -940,29 +977,34 @@ class LSPService:
         ``hermes lsp status --json``.
         """
         now = time.time()
+        # Snapshot under the lock; sample /proc outside it so status never
+        # holds the hot-path lock during file I/O.
         with self._state_lock:
-            clients = []
-            for k, c in self._clients.items():
-                last = self._last_used.get(k)
-                mem = c.memory_usage()
-                clients.append(
-                    {
-                        "server_id": k[0],
-                        "workspace_root": k[1],
-                        "state": c.state,
-                        "running": c.is_running,
-                        "pid": c.pid,
-                        "created_at": c.created_at,
-                        "age_seconds": round(now - c.created_at, 1) if c.created_at else None,
-                        "last_used_at": last,
-                        "idle_seconds": round(now - last, 1) if last else None,
-                        "inflight": self._inflight.get(k, 0),
-                        "rss_kb": mem.get("rss_kb"),
-                        "swap_kb": mem.get("swap_kb"),
-                    }
-                )
+            snapshot = [
+                (k, c, self._last_used.get(k), self._inflight.get(k, 0))
+                for k, c in self._clients.items()
+            ]
             broken = list(self._broken)
             reaper_alive = self._reaper_task is not None and not self._reaper_task.done()
+        clients = []
+        for k, c, last, inflight in snapshot:
+            mem = c.memory_usage()
+            clients.append(
+                {
+                    "server_id": k[0],
+                    "workspace_root": k[1],
+                    "state": c.state,
+                    "running": c.is_running,
+                    "pid": c.pid,
+                    "created_at": c.created_at,
+                    "age_seconds": round(now - c.created_at, 1) if c.created_at else None,
+                    "last_used_at": last,
+                    "idle_seconds": round(now - last, 1) if last else None,
+                    "inflight": inflight,
+                    "rss_kb": mem.get("rss_kb"),
+                    "swap_kb": mem.get("swap_kb"),
+                }
+            )
         return {
             "enabled": self._enabled,
             "wait_mode": self._wait_mode,

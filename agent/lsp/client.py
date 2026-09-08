@@ -45,6 +45,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
@@ -324,8 +325,7 @@ class LSPClient:
                 cwd=self._cwd,
                 start_new_session=True,
             )
-            import time as _time
-            self.created_at = _time.time()
+            self.created_at = time.time()
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
