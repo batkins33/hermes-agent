@@ -3056,13 +3056,15 @@ DEFAULT_CONFIG = {
         # Seconds between reaper passes (floor 1).
         "reap_interval": 60,
         # Seconds to wait for a graceful LSP shutdown/exit before
-        # SIGKILL.
+        # SIGKILL.  0 means escalate to SIGKILL immediately; it is
+        # never an unbounded wait.
         "shutdown_grace": 10,
         # Caps on live servers: total, and per server id across
-        # workspaces.  0 = unlimited.  When a cap is hit the
-        # least-recently-used idle server is shut down to make room;
-        # if every server is busy the new spawn is refused and the
-        # edit falls back to the in-process syntax check.
+        # workspaces.  0 = unlimited.  Spawns already in flight count
+        # toward the caps.  When a cap is hit the least-recently-used
+        # idle server is shut down to make room; if every server is
+        # busy the new spawn is refused and the edit falls back to the
+        # in-process syntax check.
         "max_servers": 8,
         "max_servers_per_id": 3,
     },

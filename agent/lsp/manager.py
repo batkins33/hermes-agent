@@ -237,6 +237,7 @@ class LSPService:
         self._reaper_errors = 0
         self._last_reap_at: Optional[float] = None
         self._reaper_task: Optional[asyncio.Task] = None
+        self._closed = False
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
@@ -516,8 +517,9 @@ class LSPService:
         the final sweep, then every client is shut down (gracefully,
         then forced), then the loop stops.  Idempotent.
         """
-        if not self._enabled:
+        if not self._enabled or self._closed:
             return
+        self._closed = True
         try:
             self._loop.run(self._stop_reaper(), timeout=5.0)
         except Exception as e:  # noqa: BLE001
@@ -535,7 +537,7 @@ class LSPService:
         Exposed for ``hermes lsp status``-style tooling and tests; the
         background reaper calls the same coroutine.
         """
-        if not self._enabled or self._loop.loop is None:
+        if not self._enabled or self._closed or self._loop.loop is None:
             return 0
         try:
             return int(self._loop.run(self._reap_idle(), timeout=self._shutdown_grace + 15.0) or 0)
@@ -733,6 +735,14 @@ class LSPService:
             spawn_future.set_result(client)
             return client
         finally:
+            # Every exit path — including cancellation of this coroutine by
+            # the caller's timeout or an unexpected raise from build_spawn /
+            # the client constructor — must release same-key waiters, or
+            # they hang until their own timeout and poison the key
+            # (TAN-1039 review).  set_result, not cancel: waiters only
+            # handle Exception.
+            if not spawn_future.done():
+                spawn_future.set_result(None)
             with self._state_lock:
                 self._spawning.pop(key, None)
 
@@ -814,45 +824,68 @@ class LSPService:
             self._inflight.pop(key, None)
             return client
 
+    def _claim(self, key: _Key, now: float) -> Optional[Tuple[LSPClient, float]]:
+        """Atomically take ``key`` out of live state for teardown.
+
+        Must be called with ``_state_lock`` held.  A claimed key sits in
+        ``_reaping`` (invisible to concurrent passes) and is gone from
+        ``_clients`` (no new lease can be taken).  Returns the client and
+        its idle age, or None if the key vanished.
+        """
+        client = self._clients.pop(key, None)
+        if client is None:
+            return None
+        self._reaping.add(key)
+        idle = now - self._last_used.pop(key, now)
+        self._inflight.pop(key, None)
+        return client, idle
+
+    async def _teardown(self, key: _Key, client: LSPClient, idle: float, *, reason: str) -> bool:
+        """Shut a claimed client down and account for it.  Never raises.
+
+        A teardown failure is counted, logged, and answered with SIGKILL so
+        a claimed client can never become an untracked orphan — the exact
+        failure this module exists to prevent (TAN-1039 review).
+        """
+        try:
+            forced = await self._shutdown_client(client)
+            if reason == "idle":
+                self._reaped_total += 1
+            else:
+                self._evicted_total += 1
+            eventlog.log_reaped(key[0], key[1], idle, forced=forced, reason=reason)
+            return True
+        except Exception as e:  # noqa: BLE001
+            self._reaper_errors += 1
+            eventlog.log_reaper_error(e)
+            with contextlib.suppress(Exception):
+                await client.kill_now()
+            return False
+        finally:
+            with self._state_lock:
+                self._reaping.discard(key)
+
     async def _reap_idle(self) -> int:
         """One reaper pass.  Returns the number of clients reclaimed."""
         if self._idle_timeout <= 0:
             return 0
         now = time.time()
+        claimed: List[Tuple[_Key, LSPClient, float]] = []
         with self._state_lock:
-            victims = self._select_idle(now, min_idle=self._idle_timeout)
-            # Claim atomically: a key in ``_reaping`` is invisible to a
-            # concurrent pass, and it is popped from ``_clients`` here
-            # so no new lease can be taken on it.
-            claimed = []
-            for key in victims:
-                client = self._clients.pop(key, None)
-                if client is None:
-                    continue
-                self._reaping.add(key)
-                idle = now - self._last_used.pop(key, now)
-                self._inflight.pop(key, None)
-                claimed.append((key, client, idle))
+            for key in self._select_idle(now, min_idle=self._idle_timeout):
+                got = self._claim(key, now)
+                if got is not None:
+                    claimed.append((key, got[0], got[1]))
         self._last_reap_at = now
         if not claimed:
             return 0
-
-        async def _one(key: _Key, client: LSPClient, idle: float) -> bool:
-            try:
-                forced = await self._shutdown_client(client)
-                self._reaped_total += 1
-                eventlog.log_reaped(key[0], key[1], idle, forced=forced, reason="idle")
-                return True
-            finally:
-                with self._state_lock:
-                    self._reaping.discard(key)
-
         # Victims are torn down concurrently so a pass is bounded by one
-        # grace period, not N of them (TAN-1039 WARN).
+        # grace period, not N of them (TAN-1039 WARN).  _teardown never
+        # raises, so gather results are plain booleans.
         results = await asyncio.gather(
-            *(_one(k, c, i) for k, c, i in claimed), return_exceptions=True
+            *(self._teardown(k, c, i, reason="idle") for k, c, i in claimed)
         )
-        return sum(1 for r in results if r is True)
+        return sum(1 for r in results if r)
 
     async def _shutdown_client(self, client: LSPClient) -> bool:
         """Graceful shutdown with a bounded wait, then SIGKILL.
@@ -907,6 +940,11 @@ class LSPService:
         the caps allow ``key``.  Returns False — and logs once per key —
         when the caps are hit and nothing idle can be evicted.  A busy
         client is never terminated to make room.
+
+        Spawns already in flight for other keys count toward the caps, so
+        two concurrent distinct-key requests at ``max_servers=1`` resolve
+        as one spawn and one refusal (the loser's edit falls back to the
+        in-process syntax check) rather than an overshoot.
         """
         while True:
             with self._state_lock:
@@ -929,18 +967,9 @@ class LSPService:
                     break
                 # LRU = largest idle age = first after the sort in _select_idle.
                 victim = candidates[0]
-                client = self._clients.pop(victim, None)
-                self._reaping.add(victim)
-                idle = time.time() - self._last_used.pop(victim, time.time())
-                self._inflight.pop(victim, None)
-            try:
-                if client is not None:
-                    forced = await self._shutdown_client(client)
-                    self._evicted_total += 1
-                    eventlog.log_reaped(victim[0], victim[1], idle, forced=forced, reason="limit")
-            finally:
-                with self._state_lock:
-                    self._reaping.discard(victim)
+                claimed = self._claim(victim, time.time())
+            if claimed is not None:
+                await self._teardown(victim, claimed[0], claimed[1], reason="limit")
         eventlog.log_limit_reached(
             key[0], key[1], total=total, max_total=self._max_servers,
             per_id=per_id, max_per_id=self._max_servers_per_id,

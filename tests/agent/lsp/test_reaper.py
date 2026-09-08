@@ -44,9 +44,12 @@ from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
-# The reaper samples /proc and the mock ignores SIGTERM via signal(); both
-# are POSIX-only, matching the Linux gateway this component runs on.
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only lifecycle tests")
+# The reaper samples /proc, the tests scan /proc for orphans, and the mock
+# ignores SIGTERM via signal(): Linux-only, matching the gateway host.
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not Path("/proc").is_dir(),
+    reason="Linux /proc lifecycle tests",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -54,20 +57,17 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only life
 # ---------------------------------------------------------------------------
 
 
-def _swap_server(server_id: str, script: str, extra_env: dict | None = None):
+def _swap_server(server_id: str, script: str):
     """Replace one registry entry with the mock; returns a restore fn."""
     idx = next(i for i, s in enumerate(SERVERS) if s.server_id == server_id)
     original = SERVERS[idx]
 
     def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
-        env = {"MOCK_LSP_SCRIPT": script}
-        if extra_env:
-            env.update(extra_env)
         return SpawnSpec(
             command=[sys.executable, MOCK_SERVER],
             workspace_root=root,
             cwd=root,
-            env=env,
+            env={"MOCK_LSP_SCRIPT": script},
             initialization_options={},
         )
 
@@ -578,10 +578,15 @@ def test_regression_idle_pyright_does_not_survive_with_automatic_reaper(mock_reg
 
 def test_concurrent_same_key_spawn_at_cap_spawns_exactly_once(monkeypatch, tmp_path):
     """HIGH #1: at max_servers, two simultaneous requests for the same new
-    key must not both evict-and-spawn.  The eviction victim is a 'stuck'
-    server so `_make_room_for` genuinely suspends for the grace period,
-    which is the window the race lived in.  Exactly one client object,
-    one registered pid, and zero orphan mock processes for that root."""
+    key must resolve to one client.  The eviction victim is a 'stuck'
+    server so `_make_room_for` genuinely suspends for the grace period.
+    Pre-fix, the second request found neither a client nor a registered
+    spawn future during that suspension and started its own spawn (the
+    exact ordering of the two spawns then varied, but two servers were
+    created and one was orphaned or evicted).  Fixed code registers the
+    future before the suspension, so the second request awaits it.
+    Asserts one client object, one registered pid, one eviction, and zero
+    orphan mock processes for that root."""
     eventlog.reset_announce_caches()
     restore = _swap_server("pyright", "stuck")
     monkeypatch.chdir(str(tmp_path))
@@ -722,11 +727,15 @@ def test_shutdown_grace_zero_escalates_immediately(stuck_registry):
         svc.shutdown()
 
 
-def test_reaper_survives_failing_pass(mock_registry, monkeypatch):
+def test_reaper_survives_failing_pass_and_never_orphans_the_victim(mock_registry, monkeypatch):
+    """A teardown failure must be counted, logged, answered with SIGKILL
+    (the claimed client is already out of ``_clients``, so nothing else
+    would ever collect it), and must not kill the reaper task."""
     repo = _make_repo(mock_registry, "r1")
     svc = _svc(idle_timeout=0.05, reap_interval=1.0, start_reaper=True)
     try:
         svc.get_diagnostics_sync(str(repo / "x.py"))
+        pid = _single_client(svc)["pid"]
         calls = {"n": 0}
         real = svc._shutdown_client
 
@@ -737,14 +746,103 @@ def test_reaper_survives_failing_pass(mock_registry, monkeypatch):
             return await real(client)
 
         monkeypatch.setattr(svc, "_shutdown_client", _boom)
-        # First pass raises inside the victim coroutine; the key is released
-        # from _reaping and the client is already unregistered, so the
-        # process is collected by shutdown() below. The reaper stays alive.
         assert _wait_until(lambda: calls["n"] >= 1, timeout=5.0)
-        time.sleep(0.2)
+        assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0), "victim orphaned after teardown failure"
         lc = svc.get_status()["lifecycle"]
+        assert lc["reaper_errors"] == 1
         assert lc["reaper_alive"] is True
-        assert not svc._reaping
+        assert lc["reaped_total"] == 0
+        assert not svc._reaping and svc.get_status()["client_count"] == 0
+    finally:
+        svc.shutdown()
+
+
+def test_graceful_shutdown_raising_is_forced_and_counted(mock_registry, monkeypatch):
+    repo = _make_repo(mock_registry, "r1")
+    svc = _svc(idle_timeout=0.05)
+    try:
+        svc.get_diagnostics_sync(str(repo / "x.py"))
+        key = ("pyright", str(repo))
+        client = svc._clients[key]
+        pid = client.pid
+
+        async def _raise():
+            raise RuntimeError("shutdown request exploded")
+
+        monkeypatch.setattr(client, "shutdown", _raise)
+        time.sleep(0.1)
+        assert svc.reap_now() == 1
+        lc = svc.get_status()["lifecycle"]
+        assert lc["graceful_failures"] == 1 and lc["forced_total"] == 1 and lc["reaper_errors"] == 0
+        assert _wait_until(lambda: not _pid_alive(pid), timeout=5.0)
+    finally:
+        svc.shutdown()
+
+
+def test_spawn_owner_failure_releases_same_key_waiters(mock_registry, monkeypatch):
+    """If the coroutine that owns a spawn dies (here: build_spawn raises),
+    a concurrent same-key waiter must be released promptly with None
+    instead of hanging on the registered future."""
+    repo = _make_repo(mock_registry, "r1")
+    f = str(repo / "x.py")
+    svc = _svc()
+    idx = next(i for i, s in enumerate(SERVERS) if s.server_id == "pyright")
+    real_build = SERVERS[idx].build_spawn
+    gate = {"armed": True}
+
+    def _boom(root, ctx):
+        if gate["armed"]:
+            gate["armed"] = False
+            raise RuntimeError("synthetic build_spawn failure")
+        return real_build(root, ctx)
+
+    monkeypatch.setattr(SERVERS[idx], "build_spawn", _boom)
+    try:
+        async def _both():
+            async def _owner():
+                try:
+                    async with svc._leased_client(f) as c:
+                        return ("owner", c)
+                except RuntimeError as e:
+                    return ("owner-raised", str(e))
+
+            async def _waiter():
+                await asyncio.sleep(0.01)  # ensure the owner registered first
+                async with svc._leased_client(f) as c:
+                    return ("waiter", c)
+
+            return await asyncio.gather(_owner(), _waiter())
+
+        t0 = time.time()
+        owner, waiter = svc._loop.run(_both(), timeout=10.0)
+        assert time.time() - t0 < 3.0, "waiter hung on an unresolved spawn future"
+        assert owner[0] == "owner-raised"
+        assert waiter == ("waiter", None)
+        assert not svc._spawning
+        # The key is not poisoned by the waiter: a later request spawns normally.
+        assert svc.get_diagnostics_sync(f, delta=False) is not None
+        assert svc.get_status()["client_count"] == 1
+    finally:
+        svc.shutdown()
+
+
+def test_concurrent_distinct_key_spawns_at_cap_yield_one_spawn_one_refusal(mock_registry):
+    r1 = _make_repo(mock_registry, "r1")
+    r2 = _make_repo(mock_registry, "r2")
+    svc = _svc(max_servers=1)
+    try:
+        async def _both():
+            async def _one(path):
+                async with svc._leased_client(path) as c:
+                    return c
+            return await asyncio.gather(_one(str(r1 / "x.py")), _one(str(r2 / "x.py")))
+
+        a, b = svc._loop.run(_both(), timeout=30.0)
+        assert (a is None) != (b is None), "expected exactly one spawn and one refusal"
+        st = svc.get_status()
+        assert st["client_count"] == 1
+        assert st["lifecycle"]["limit_refusals"] == 1
+        assert st["lifecycle"]["evicted_total"] == 0
     finally:
         svc.shutdown()
 

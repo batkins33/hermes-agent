@@ -20,14 +20,9 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
 - ``"stuck"`` — same as ``clean`` but never answers ``shutdown``,
   ignores ``exit`` and ignores SIGTERM, so only SIGKILL ends it
   (exercises the reaper's forced-termination path).
-- ``"crash_once"`` — exits on the first ``didOpen`` unless the file
-  named by ``MOCK_LSP_CRASH_FLAG`` already exists (it is created on
-  that first crash), so a replacement server spawned by the manager
-  behaves like ``clean``.  Exercises the crashed-client lease path.
-
-Independent of the script, a document whose path contains ``slow``
-gets its diagnostics published only after a 1.0s delay, so a request
-can be held in flight deterministically.
+Independent of the script, a document whose *file name* starts with
+``slow`` gets its diagnostics published only after a 1.0s delay, so a
+request can be held in flight deterministically.
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -113,13 +108,7 @@ def main():
             td = params.get("textDocument") or {}
             uri = td.get("uri", "")
             version = td.get("version", 0)
-            if script == "crash_once" and msg.get("method") == "textDocument/didOpen":
-                flag = os.environ.get("MOCK_LSP_CRASH_FLAG")
-                if flag and not os.path.exists(flag):
-                    with open(flag, "w") as fh:
-                        fh.write("crashed\n")
-                    return 0  # die without publishing
-            if "slow" in uri:
+            if uri.rsplit("/", 1)[-1].startswith("slow"):
                 time.sleep(1.0)
             diagnostics = []
             if script == "errors":
